@@ -1,21 +1,31 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strings"
+	"syscall"
+
+	goerr "errors"
 
 	"github.com/BurntSushi/toml"
 	"github.com/dominikbraun/graph"
+	"github.com/elliotchance/orderedmap/v2"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/otiai10/copy"
+	"golang.org/x/mod/module"
 	"kcl-lang.io/kcl-go/pkg/kcl"
+	"oras.land/oras-go/pkg/auth"
+	"oras.land/oras-go/v2"
+	remoteauth "oras.land/oras-go/v2/registry/remote/auth"
+
 	"kcl-lang.io/kpm/pkg/constants"
+	"kcl-lang.io/kpm/pkg/downloader"
 	"kcl-lang.io/kpm/pkg/env"
 	"kcl-lang.io/kpm/pkg/errors"
 	"kcl-lang.io/kpm/pkg/git"
@@ -26,13 +36,16 @@ import (
 	"kcl-lang.io/kpm/pkg/runner"
 	"kcl-lang.io/kpm/pkg/settings"
 	"kcl-lang.io/kpm/pkg/utils"
-	"oras.land/oras-go/v2"
 )
 
 // KpmClient is the client of kpm.
 type KpmClient struct {
 	// The writer of the log.
 	logWriter io.Writer
+	// The downloader of the dependencies.
+	DepDownloader *downloader.DepDownloader
+	// credential store
+	credsClient *downloader.CredClient
 	// The home path of kpm for global configuration file and kcl package storage path.
 	homePath string
 	// The settings of kpm loaded from the global configuration file.
@@ -55,15 +68,43 @@ func NewKpmClient() (*KpmClient, error) {
 	}
 
 	return &KpmClient{
-		logWriter: os.Stdout,
-		settings:  *settings,
-		homePath:  homePath,
+		logWriter:     os.Stdout,
+		settings:      *settings,
+		homePath:      homePath,
+		DepDownloader: &downloader.DepDownloader{},
 	}, nil
 }
 
 // SetNoSumCheck will set the 'noSumCheck' flag.
 func (c *KpmClient) SetNoSumCheck(noSumCheck bool) {
 	c.noSumCheck = noSumCheck
+}
+
+// GetCredsClient will return the credential client.
+func (c *KpmClient) GetCredsClient() (*downloader.CredClient, error) {
+	if c.credsClient == nil {
+		credCli, err := downloader.LoadCredentialFile(c.settings.CredentialsFile)
+		if err != nil {
+			return nil, err
+		}
+		c.credsClient = credCli
+	}
+	return c.credsClient, nil
+}
+
+// GetCredentials will return the credentials of the host.
+func (c *KpmClient) GetCredentials(hostName string) (*remoteauth.Credential, error) {
+	credCli, err := c.GetCredsClient()
+	if err != nil {
+		return nil, err
+	}
+
+	creds, err := credCli.Credential(hostName)
+	if err != nil {
+		return nil, err
+	}
+
+	return creds, nil
 }
 
 // GetNoSumCheck will return the 'noSumCheck' flag.
@@ -112,6 +153,32 @@ func (c *KpmClient) LoadPkgFromPath(pkgPath string) (*pkg.KclPkg, error) {
 		return nil, reporter.NewErrorEvent(reporter.FailedLoadKclMod, err, fmt.Sprintf("could not load 'kcl.mod.lock' in '%s'", pkgPath))
 	}
 
+	// Align the dependencies between kcl.mod and kcl.mod.lock.
+	for _, name := range modFile.Dependencies.Deps.Keys() {
+		dep, ok := modFile.Dependencies.Deps.Get(name)
+		if !ok {
+			break
+		}
+		if dep.Local != nil {
+			if ldep, ok := deps.Deps.Get(name); ok {
+				var localFullPath string
+				if filepath.IsAbs(dep.Local.Path) {
+					localFullPath = dep.Local.Path
+				} else {
+					localFullPath, err = filepath.Abs(filepath.Join(pkgPath, dep.Local.Path))
+					if err != nil {
+						return nil, reporter.NewErrorEvent(reporter.Bug, err, "internal bugs, please contact us to fix it.")
+					}
+				}
+				ldep.LocalFullPath = localFullPath
+				dep.LocalFullPath = localFullPath
+				ldep.Source = dep.Source
+				deps.Deps.Set(name, ldep)
+				modFile.Dependencies.Deps.Set(name, dep)
+			}
+		}
+	}
+
 	return &pkg.KclPkg{
 		ModFile:      *modFile,
 		HomePath:     pkgPath,
@@ -129,7 +196,7 @@ func (c *KpmClient) LoadModFile(pkgPath string) (*pkg.ModFile, error) {
 	modFile.HomePath = pkgPath
 
 	if modFile.Dependencies.Deps == nil {
-		modFile.Dependencies.Deps = make(map[string]pkg.Dependency)
+		modFile.Dependencies.Deps = orderedmap.NewOrderedMap[string, pkg.Dependency]()
 	}
 	err = c.FillDependenciesInfo(modFile)
 	if err != nil {
@@ -139,8 +206,55 @@ func (c *KpmClient) LoadModFile(pkgPath string) (*pkg.ModFile, error) {
 	return modFile, nil
 }
 
+// Load the kcl.mod.lock and acquire the checksum of the dependencies from OCI registry.
 func (c *KpmClient) LoadLockDeps(pkgPath string) (*pkg.Dependencies, error) {
-	return pkg.LoadLockDeps(pkgPath)
+	deps, err := pkg.LoadLockDeps(pkgPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return deps, nil
+}
+
+// AcquireDepSum will acquire the checksum of the dependency from the OCI registry.
+func (c *KpmClient) AcquireDepSum(dep pkg.Dependency) (string, error) {
+	// Only the dependencies from the OCI need can be checked.
+	if dep.Source.Oci != nil {
+		if len(dep.Source.Oci.Reg) == 0 {
+			dep.Source.Oci.Reg = c.GetSettings().DefaultOciRegistry()
+		}
+
+		if len(dep.Source.Oci.Repo) == 0 {
+			urlpath := utils.JoinPath(c.GetSettings().DefaultOciRepo(), dep.Name)
+			dep.Source.Oci.Repo = urlpath
+		}
+		// Fetch the metadata of the OCI manifest.
+		manifest := ocispec.Manifest{}
+		jsonDesc, err := c.FetchOciManifestIntoJsonStr(opt.OciFetchOptions{
+			FetchBytesOptions: oras.DefaultFetchBytesOptions,
+			OciOptions: opt.OciOptions{
+				Reg:  dep.Source.Oci.Reg,
+				Repo: dep.Source.Oci.Repo,
+				Tag:  dep.Source.Oci.Tag,
+			},
+		})
+
+		if err != nil {
+			return "", reporter.NewErrorEvent(reporter.FailedFetchOciManifest, err, fmt.Sprintf("failed to fetch the manifest of '%s'", dep.Name))
+		}
+
+		err = json.Unmarshal([]byte(jsonDesc), &manifest)
+		if err != nil {
+			return "", err
+		}
+
+		// Check the dependency checksum.
+		if value, ok := manifest.Annotations[constants.DEFAULT_KCL_OCI_MANIFEST_SUM]; ok {
+			return value, nil
+		}
+	}
+
+	return "", nil
 }
 
 // ResolveDepsIntoMap will calculate the map of kcl package name and local storage path of the external packages.
@@ -162,24 +276,53 @@ func (c *KpmClient) ResolveDepsIntoMap(kclPkg *pkg.KclPkg) (map[string]string, e
 	return pkgMap, nil
 }
 
+const PKG_NAME_PATTERN = "%s_%s"
+
+// Get the local store path for the dependency.
+// 1. in the KCL_PKG_PATH: default is $HOME/.kcl/kpm
+// 2. in the vendor subdirectory of the current package.
+// 3. the dependency is from the local path.
+func (c *KpmClient) getDepStorePath(search_path string, d *pkg.Dependency, isVendor bool) string {
+
+	storePkgName := d.GenPathSuffix()
+
+	if d.IsFromLocal() {
+		return d.GetLocalFullPath(search_path)
+	} else {
+		if isVendor {
+			return filepath.Join(search_path, "vendor", storePkgName)
+		} else {
+			return filepath.Join(c.homePath, storePkgName)
+		}
+	}
+}
+
 // ResolveDepsMetadata will calculate the local storage path of the external package,
 // and check whether the package exists locally.
 // If the package does not exist, it will re-download to the local.
+// Since redownloads are not triggered if local dependencies exists,
+// indirect dependencies are also synchronized to the lock file by `lockDeps`.
 func (c *KpmClient) ResolvePkgDepsMetadata(kclPkg *pkg.KclPkg, update bool) error {
-	var searchPath string
-	kclPkg.NoSumCheck = c.noSumCheck
-
 	if kclPkg.IsVendorMode() {
 		// In the vendor mode, the search path is the vendor subdirectory of the current package.
 		err := c.VendorDeps(kclPkg)
 		if err != nil {
 			return err
 		}
-		searchPath = kclPkg.LocalVendorPath()
 	} else {
-		// Otherwise, the search path is the $KCL_PKG_PATH.
-		searchPath = c.homePath
+		// In the non-vendor mode, the search path is the KCL_PKG_PATH.
+		err := c.resolvePkgDeps(kclPkg, &kclPkg.Dependencies, update)
+		if err != nil {
+			return err
+		}
+
 	}
+	return nil
+}
+
+func (c *KpmClient) resolvePkgDeps(kclPkg *pkg.KclPkg, lockDeps *pkg.Dependencies, update bool) error {
+	var searchPath string
+	kclPkg.NoSumCheck = c.noSumCheck
 
 	// If under the mode of '--no_sum_check', the checksum of the package will not be checked.
 	// There is no kcl.mod.lock, and the dependencies in kcl.mod and kcl.mod.lock do not need to be aligned.
@@ -190,24 +333,24 @@ func (c *KpmClient) ResolvePkgDepsMetadata(kclPkg *pkg.KclPkg, update bool) erro
 		// alian the dependencies between kcl.mod and kcl.mod.lock
 		// clean the dependencies in kcl.mod.lock which not in kcl.mod
 		// clean the dependencies in kcl.mod.lock and kcl.mod which have different version
-		for name, dep := range kclPkg.Dependencies.Deps {
-			modDep, ok := kclPkg.ModFile.Dependencies.Deps[name]
-			if !ok || !dep.WithTheSameVersion(modDep) {
-				reporter.ReportMsgTo(
-					fmt.Sprintf("removing '%s' with version '%s'", name, dep.Version),
-					c.logWriter,
-				)
-				delete(kclPkg.Dependencies.Deps, name)
+		for _, name := range kclPkg.Dependencies.Deps.Keys() {
+			dep, ok := kclPkg.Dependencies.Deps.Get(name)
+			if !ok {
+				break
+			}
+			modDep, ok := kclPkg.ModFile.Dependencies.Deps.Get(name)
+			if !ok || !dep.Equals(modDep) {
+				kclPkg.Dependencies.Deps.Delete(name)
 			}
 		}
 		// add the dependencies in kcl.mod which not in kcl.mod.lock
-		for name, d := range kclPkg.ModFile.Dependencies.Deps {
-			if _, ok := kclPkg.Dependencies.Deps[name]; !ok {
-				reporter.ReportMsgTo(
-					fmt.Sprintf("adding '%s' with version '%s'", name, d.Version),
-					c.logWriter,
-				)
-				kclPkg.Dependencies.Deps[name] = d
+		for _, name := range kclPkg.ModFile.Dependencies.Deps.Keys() {
+			d, ok := kclPkg.ModFile.Dependencies.Deps.Get(name)
+			if !ok {
+				break
+			}
+			if _, ok := kclPkg.Dependencies.Deps.Get(name); !ok {
+				kclPkg.Dependencies.Deps.Set(name, d)
 			}
 		}
 	} else {
@@ -216,63 +359,86 @@ func (c *KpmClient) ResolvePkgDepsMetadata(kclPkg *pkg.KclPkg, update bool) erro
 		kclPkg.Dependencies.Deps = kclPkg.ModFile.Dependencies.Deps
 	}
 
-	for name, d := range kclPkg.Dependencies.Deps {
-		searchFullPath := filepath.Join(searchPath, d.FullName)
-		if !update {
+	for _, name := range kclPkg.Dependencies.Deps.Keys() {
+		d, ok := kclPkg.Dependencies.Deps.Get(name)
+		if !ok {
+			break
+		}
+		searchPath = c.getDepStorePath(kclPkg.HomePath, &d, kclPkg.IsVendorMode())
+		depPath := searchPath
+		// if the dependency is not exist
+		if !utils.DirExists(searchPath) {
 			if d.IsFromLocal() {
-				searchFullPath = d.GetLocalFullPath(kclPkg.HomePath)
-			}
-
-			// Find it and update the local path of the dependency.
-			d.LocalFullPath = searchFullPath
-			kclPkg.Dependencies.Deps[name] = d
-
-		} else {
-			if utils.DirExists(searchFullPath) && (c.GetNoSumCheck() || utils.CheckPackageSum(d.Sum, searchFullPath)) {
-				// Find it and update the local path of the dependency.
-				d.LocalFullPath = searchFullPath
-				kclPkg.Dependencies.Deps[name] = d
-			} else if d.IsFromLocal() && !utils.DirExists(d.GetLocalFullPath(kclPkg.HomePath)) {
-				return reporter.NewErrorEvent(reporter.DependencyNotFound, fmt.Errorf("dependency '%s' not found in '%s'", d.Name, searchFullPath))
-			} else if d.IsFromLocal() && utils.DirExists(d.GetLocalFullPath(kclPkg.HomePath)) {
-				sum, err := utils.HashDir(d.GetLocalFullPath(kclPkg.HomePath))
-				if err != nil {
-					return reporter.NewErrorEvent(reporter.CalSumFailed, err, fmt.Sprintf("failed to calculate checksum for '%s' in '%s'", d.Name, searchFullPath))
-				}
-				d.Sum = sum
-				kclPkg.Dependencies.Deps[name] = d
+				// If the dependency is from the local path, and it does not exist locally, raise an error
+				return reporter.NewErrorEvent(reporter.DependencyNotFound, fmt.Errorf("dependency '%s' not found in '%s'", d.Name, searchPath))
 			} else {
-				// Otherwise, re-vendor it.
-				if kclPkg.IsVendorMode() {
-					err := c.VendorDeps(kclPkg)
-					if err != nil {
-						return err
+				// redownload the dependency to the local path.
+				if update {
+					// re-vendor it.
+					if kclPkg.IsVendorMode() {
+						err := c.vendorDeps(kclPkg, kclPkg.LocalVendorPath())
+						if err != nil {
+							return err
+						}
+					} else {
+						// re-download it.
+						err := c.AddDepToPkg(kclPkg, &d)
+						if err != nil {
+							return err
+						}
+
+						depPath = c.getDepStorePath(kclPkg.HomePath, &d, kclPkg.IsVendorMode())
 					}
 				} else {
-					// Or, re-download it.
-					err := c.AddDepToPkg(kclPkg, &d)
-					if err != nil {
-						return err
-					}
+					continue
 				}
-				// After re-downloading or re-vendoring,
-				// re-resolving is required to update the dependent paths.
-				err := c.ResolvePkgDepsMetadata(kclPkg, update)
-				if err != nil {
-					return err
-				}
-				return nil
 			}
 		}
+
+		// If the dependency exists locally, load the dependency package.
+		depPkg, err := c.LoadPkgFromPath(depPath)
+		if err != nil {
+			return reporter.NewErrorEvent(
+				reporter.DependencyNotFound,
+				fmt.Errorf("dependency '%s' not found in '%s'", d.Name, searchPath),
+				// todo: add command to clean the package cache
+			)
+		}
+		d.FromKclPkg(depPkg)
+		err = c.resolvePkgDeps(depPkg, lockDeps, update)
+		if err != nil {
+			return err
+		}
+		kclPkg.Dependencies.Deps.Set(name, d)
+		lockDeps.Deps.Set(name, d)
 	}
-	if update {
-		// update the kcl.mod and kcl.mod.lock.
-		err := kclPkg.UpdateModAndLockFile()
+
+	// Generate file kcl.mod.lock.
+	if !kclPkg.NoSumCheck || !update {
+		err := kclPkg.LockDepsVersion()
 		if err != nil {
 			return err
 		}
 	}
+
 	return nil
+}
+
+func GetReleasesFromSource(sourceType, uri string) ([]string, error) {
+	var releases []string
+	var err error
+
+	switch sourceType {
+	case pkg.GIT:
+		releases, err = git.GetAllGithubReleases(uri)
+	case pkg.OCI:
+		releases, err = oci.GetAllImageTags(uri)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return releases, nil
 }
 
 // UpdateDeps will update the dependencies.
@@ -282,9 +448,18 @@ func (c *KpmClient) UpdateDeps(kclPkg *pkg.KclPkg) error {
 		return err
 	}
 
-	err = kclPkg.UpdateModAndLockFile()
+	// update kcl.mod
+	err = kclPkg.ModFile.StoreModFile()
 	if err != nil {
 		return err
+	}
+
+	// Generate file kcl.mod.lock.
+	if !kclPkg.NoSumCheck {
+		err := kclPkg.LockDepsVersion()
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -339,8 +514,9 @@ func (c *KpmClient) CompileWithOpts(opts *opt.CompileOptions) (*kcl.KCLResultLis
 	}
 
 	c.noSumCheck = opts.NoSumCheck()
+	c.logWriter = opts.LogWriter()
 
-	kclPkg, err := pkg.LoadKclPkg(pkgPath)
+	kclPkg, err := c.LoadPkgFromPath(pkgPath)
 	if err != nil {
 		return nil, err
 	}
@@ -367,9 +543,15 @@ func (c *KpmClient) CompileWithOpts(opts *opt.CompileOptions) (*kcl.KCLResultLis
 				opts.Merge(kcl.WithKFilenames(filepath.Join(opts.PkgPath(), entry)))
 			}
 		}
-	} else if len(kclPkg.GetEntryKclFilesFromModFile()) == 0 && !opts.HasSettingsYaml() {
-		// no entry
-		opts.Merge(kcl.WithKFilenames(opts.PkgPath()))
+	} else if len(kclPkg.GetEntryKclFilesFromModFile()) == 0 {
+		// No entries profile in kcl.mod and no file settings in the settings file
+		if !opts.HasSettingsYaml() {
+			// No settings file.
+			opts.Merge(kcl.WithKFilenames(opts.PkgPath()))
+		} else if opts.HasSettingsYaml() && len(opts.KFilenameList) == 0 {
+			// Has settings file but no file config in the settings files.
+			opts.Merge(kcl.WithKFilenames(opts.PkgPath()))
+		}
 	}
 	opts.Merge(kcl.WithWorkDir(opts.PkgPath()))
 
@@ -384,6 +566,15 @@ func (c *KpmClient) CompileWithOpts(opts *opt.CompileOptions) (*kcl.KCLResultLis
 	}
 
 	return compileResult, nil
+}
+
+// RunWithOpts will compile the kcl package with the compile options.
+func (c *KpmClient) RunWithOpts(opts ...opt.Option) (*kcl.KCLResultList, error) {
+	mergedOpts := opt.DefaultCompileOptions()
+	for _, opt := range opts {
+		opt(mergedOpts)
+	}
+	return c.CompileWithOpts(mergedOpts)
 }
 
 // CompilePkgWithOpts will compile the kcl package with the compile options.
@@ -487,7 +678,7 @@ func (c *KpmClient) CompileOciPkg(ociSource, version string, opts *opt.CompileOp
 	// clean the temp dir.
 	defer os.RemoveAll(tmpDir)
 
-	localPath := ociOpts.AddStoragePathSuffix(tmpDir)
+	localPath := ociOpts.SanitizePathWithSuffix(tmpDir)
 
 	// 2. Pull the tar.
 	err = c.pullTarFromOci(localPath, ociOpts)
@@ -566,6 +757,7 @@ func (c *KpmClient) AddDepWithOpts(kclPkg *pkg.KclPkg, opt *opt.AddOptions) (*pk
 		fmt.Sprintf("adding dependency '%s'", d.Name),
 		c.logWriter,
 	)
+
 	// 2. download the dependency to the local path.
 	err = c.AddDepToPkg(kclPkg, d)
 	if err != nil {
@@ -573,6 +765,29 @@ func (c *KpmClient) AddDepWithOpts(kclPkg *pkg.KclPkg, opt *opt.AddOptions) (*pk
 	}
 
 	// 3. update the kcl.mod and kcl.mod.lock.
+	if opt.NewPkgName != "" {
+		// update the kcl.mod with NewPkgName
+		tempDeps, ok := kclPkg.ModFile.Dependencies.Deps.Get(d.Name)
+		if !ok {
+			return nil, fmt.Errorf("dependency '%s' not found in 'kcl.mod'", d.Name)
+		}
+		tempDeps.Name = opt.NewPkgName
+		kclPkg.ModFile.Dependencies.Deps.Set(d.Name, tempDeps)
+
+		// update the kcl.mod.lock with NewPkgName
+		tempDeps, ok = kclPkg.Dependencies.Deps.Get(d.Name)
+		if !ok {
+			return nil, fmt.Errorf("dependency '%s' not found in 'kcl.mod.lock'", d.Name)
+		}
+		tempDeps.Name = opt.NewPkgName
+		tempDeps.FullName = opt.NewPkgName + "_" + tempDeps.Version
+		kclPkg.Dependencies.Deps.Set(d.Name, tempDeps)
+
+		// update the key of kclPkg.Dependencies.Deps from d.Name to opt.NewPkgName
+		kclPkg.Dependencies.Deps.Set(opt.NewPkgName, kclPkg.Dependencies.Deps.GetOrDefault(d.Name, pkg.TestPkgDependency))
+		kclPkg.Dependencies.Deps.Delete(d.Name)
+	}
+
 	err = kclPkg.UpdateModAndLockFile()
 	if err != nil {
 		return nil, err
@@ -593,22 +808,25 @@ func (c *KpmClient) AddDepWithOpts(kclPkg *pkg.KclPkg, opt *opt.AddOptions) (*pk
 // AddDepToPkg will add a dependency to the kcl package.
 func (c *KpmClient) AddDepToPkg(kclPkg *pkg.KclPkg, d *pkg.Dependency) error {
 
-	if !reflect.DeepEqual(kclPkg.ModFile.Dependencies.Deps[d.Name], *d) {
+	// If the dependency is from the local path, do nothing.
+	if d.IsFromLocal() {
+		kclPkg.ModFile.Dependencies.Deps.Set(d.Name, *d)
+		kclPkg.Dependencies.Deps.Set(d.Name, *d)
+		return nil
+	}
+
+	// Some field will be empty when the dependency is add from CLI.
+	// For avoiding re-download the dependency, just complete part of the fields not all of them.
+	if !kclPkg.ModFile.Dependencies.Deps.GetOrDefault(d.Name, pkg.TestPkgDependency).Equals(*d) {
 		// the dep passed on the cli is different from the kcl.mod.
-		kclPkg.ModFile.Dependencies.Deps[d.Name] = *d
+		kclPkg.ModFile.Dependencies.Deps.Set(d.Name, *d)
 	}
 
 	// download all the dependencies.
-	changedDeps, _, err := c.InitGraphAndDownloadDeps(kclPkg)
+	_, _, err := c.InitGraphAndDownloadDeps(kclPkg)
 
 	if err != nil {
 		return err
-	}
-
-	// Update kcl.mod and kcl.mod.lock
-	for k, v := range changedDeps.Deps {
-		kclPkg.ModFile.Dependencies.Deps[k] = v
-		kclPkg.Dependencies.Deps[k] = v
 	}
 
 	return err
@@ -646,10 +864,88 @@ func (c *KpmClient) Package(kclPkg *pkg.KclPkg, tarPath string, vendorMode bool)
 	}
 
 	// Tar the current kcl package into a "*.tar" file.
-	err := utils.TarDir(kclPkg.HomePath, tarPath)
+	err := utils.TarDir(kclPkg.HomePath, tarPath, kclPkg.GetPkgInclude(), kclPkg.GetPkgExclude())
 	if err != nil {
 		return reporter.NewErrorEvent(reporter.FailedPackage, err, "failed to package the kcl module")
 	}
+	return nil
+}
+
+func (c *KpmClient) vendorDeps(kclPkg *pkg.KclPkg, vendorPath string) error {
+	lockDeps := make([]pkg.Dependency, 0, kclPkg.Dependencies.Deps.Len())
+	for _, k := range kclPkg.Dependencies.Deps.Keys() {
+		d, _ := kclPkg.Dependencies.Deps.Get(k)
+		lockDeps = append(lockDeps, d)
+	}
+
+	// Traverse all dependencies in kcl.mod.lock.
+	for i := 0; i < len(lockDeps); i++ {
+		d := lockDeps[i]
+		if len(d.Name) == 0 {
+			return errors.InvalidDependency
+		}
+		// If the dependency is from the local path, do not vendor it, vendor its dependencies.
+		if d.IsFromLocal() {
+			dpkg, err := c.LoadPkgFromPath(d.GetLocalFullPath(kclPkg.HomePath))
+			if err != nil {
+				return err
+			}
+			err = c.vendorDeps(dpkg, vendorPath)
+			if err != nil {
+				return err
+			}
+			continue
+		} else {
+			vendorFullPath := filepath.Join(vendorPath, d.GenPathSuffix())
+			// If the package already exists in the 'vendor', do nothing.
+			if utils.DirExists(vendorFullPath) {
+				d.LocalFullPath = vendorFullPath
+				lockDeps[i] = d
+				continue
+			} else {
+				// If not in the 'vendor', check the global cache.
+				cacheFullPath := c.getDepStorePath(c.homePath, &d, false)
+				if utils.DirExists(cacheFullPath) {
+					// If there is, copy it into the 'vendor' directory.
+					err := copy.Copy(cacheFullPath, vendorFullPath)
+					if err != nil {
+						return err
+					}
+				} else {
+					// re-download if not.
+					err := c.AddDepToPkg(kclPkg, &d)
+					if err != nil {
+						return err
+					}
+					// re-vendor again with new kcl.mod and kcl.mod.lock
+					err = c.vendorDeps(kclPkg, vendorPath)
+					if err != nil {
+						return err
+					}
+					return nil
+				}
+			}
+
+			dpkg, err := c.LoadPkgFromPath(vendorFullPath)
+			if err != nil {
+				return err
+			}
+
+			// Vendor the dependencies of the current dependency.
+			err = c.vendorDeps(dpkg, vendorPath)
+			if err != nil {
+				return err
+			}
+			d.LocalFullPath = vendorFullPath
+			lockDeps[i] = d
+		}
+	}
+
+	// Update the dependencies in kcl.mod.lock.
+	for _, d := range lockDeps {
+		kclPkg.Dependencies.Deps.Set(d.Name, d)
+	}
+
 	return nil
 }
 
@@ -662,166 +958,316 @@ func (c *KpmClient) VendorDeps(kclPkg *pkg.KclPkg) error {
 		return err
 	}
 
-	lockDeps := make([]pkg.Dependency, 0, len(kclPkg.Dependencies.Deps))
-
-	for _, d := range kclPkg.Dependencies.Deps {
-		lockDeps = append(lockDeps, d)
-	}
-
-	// Traverse all dependencies in kcl.mod.lock.
-	for i := 0; i < len(lockDeps); i++ {
-		d := lockDeps[i]
-		if len(d.Name) == 0 {
-			return errors.InvalidDependency
-		}
-		vendorFullPath := filepath.Join(vendorPath, d.FullName)
-		// If the package already exists in the 'vendor', do nothing.
-		if utils.DirExists(vendorFullPath) && check(d, vendorFullPath) {
-			continue
-		} else {
-			// If not in the 'vendor', check the global cache.
-			cacheFullPath := filepath.Join(c.homePath, d.FullName)
-			if utils.DirExists(cacheFullPath) && check(d, cacheFullPath) {
-				// If there is, copy it into the 'vendor' directory.
-				err := copy.Copy(cacheFullPath, vendorFullPath)
-				if err != nil {
-					return err
-				}
-			} else if utils.DirExists(d.GetLocalFullPath(kclPkg.HomePath)) && check(d, d.GetLocalFullPath(kclPkg.HomePath)) {
-				// If there is, copy it into the 'vendor' directory.
-				err := copy.Copy(d.GetLocalFullPath(kclPkg.HomePath), vendorFullPath)
-				if err != nil {
-					return err
-				}
-			} else {
-				// re-download if not.
-				err = c.AddDepToPkg(kclPkg, &d)
-				if err != nil {
-					return err
-				}
-				// re-vendor again with new kcl.mod and kcl.mod.lock
-				err = c.VendorDeps(kclPkg)
-				if err != nil {
-					return err
-				}
-				return nil
-			}
-		}
-	}
-
-	return nil
+	return c.vendorDeps(kclPkg, vendorPath)
 }
 
 // FillDepInfo will fill registry information for a dependency.
-func (c *KpmClient) FillDepInfo(dep *pkg.Dependency) error {
+func (c *KpmClient) FillDepInfo(dep *pkg.Dependency, homepath string) error {
+	// Homepath for a dependency is the homepath of the kcl package.
 	if dep.Source.Local != nil {
 		dep.LocalFullPath = dep.Source.Local.Path
 		return nil
 	}
 	if dep.Source.Oci != nil {
-		dep.Source.Oci.Reg = c.GetSettings().DefaultOciRegistry()
-		urlpath := utils.JoinPath(c.GetSettings().DefaultOciRepo(), dep.Name)
-		dep.Source.Oci.Repo = urlpath
-		manifest := ocispec.Manifest{}
-		jsonDesc, err := c.FetchOciManifestIntoJsonStr(opt.OciFetchOptions{
-			FetchBytesOptions: oras.DefaultFetchBytesOptions,
-			OciOptions: opt.OciOptions{
-				Reg:  c.GetSettings().DefaultOciRegistry(),
-				Repo: fmt.Sprintf("%s/%s", c.GetSettings().DefaultOciRepo(), dep.Name),
-				Tag:  dep.Version,
-			},
-		})
-
-		if err != nil {
-			return err
+		if len(dep.Source.Oci.Reg) == 0 {
+			dep.Source.Oci.Reg = c.GetSettings().DefaultOciRegistry()
 		}
 
-		err = json.Unmarshal([]byte(jsonDesc), &manifest)
-		if err != nil {
-			return err
+		if len(dep.Source.Oci.Repo) == 0 {
+			urlpath := utils.JoinPath(c.GetSettings().DefaultOciRepo(), dep.Name)
+			dep.Source.Oci.Repo = urlpath
+		}
+	}
+	if dep.Source.Registry != nil {
+		if len(dep.Source.Registry.Reg) == 0 {
+			dep.Source.Registry.Reg = c.GetSettings().DefaultOciRegistry()
 		}
 
-		if value, ok := manifest.Annotations[constants.DEFAULT_KCL_OCI_MANIFEST_SUM]; ok {
-			dep.Sum = value
+		if len(dep.Source.Registry.Repo) == 0 {
+			urlpath := utils.JoinPath(c.GetSettings().DefaultOciRepo(), dep.Name)
+			dep.Source.Registry.Repo = urlpath
 		}
-		return nil
+
+		dep.Version = dep.Source.Registry.Version
 	}
 	return nil
 }
 
 // FillDependenciesInfo will fill registry information for all dependencies in a kcl.mod.
 func (c *KpmClient) FillDependenciesInfo(modFile *pkg.ModFile) error {
-	for k, v := range modFile.Deps {
-		err := c.FillDepInfo(&v)
+	for _, k := range modFile.Deps.Keys() {
+		v, ok := modFile.Deps.Get(k)
+		if !ok {
+			break
+		}
+		err := c.FillDepInfo(&v, modFile.HomePath)
 		if err != nil {
 			return err
 		}
-		modFile.Deps[k] = v
+		modFile.Deps.Set(k, v)
 	}
 	return nil
 }
 
-// Download will download the dependency to the local path.
-func (c *KpmClient) Download(dep *pkg.Dependency, localPath string) (*pkg.Dependency, error) {
-	if dep.Source.Git != nil {
-		_, err := c.DownloadFromGit(dep.Source.Git, localPath)
-		if err != nil {
-			return nil, err
-		}
+// AcquireTheLatestOciVersion will acquire the latest version of the OCI reference.
+func (c *KpmClient) AcquireTheLatestOciVersion(ociSource downloader.Oci) (string, error) {
+	repoPath := utils.JoinPath(ociSource.Reg, ociSource.Repo)
+	cred, err := c.GetCredentials(ociSource.Reg)
+	if err != nil {
+		return "", err
+	}
 
-		dep.LocalFullPath = localPath
-		// Creating symbolic links in a global cache is not an optimal solution.
-		// This allows kclvm to locate the package by default.
-		// This feature is unstable and will be removed soon.
-		err = createDepRef(dep.LocalFullPath, filepath.Join(filepath.Dir(localPath), dep.Name))
-		if err != nil {
-			return nil, err
-		}
-		dep.FullName = dep.GenDepFullName()
-		// If the dependency is from git commit, the version is the commit id.
-		// If the dependency is from git tag, the version is the tag.
-		dep.Version, err = dep.Source.Git.GetValidGitReference()
+	ociClient, err := oci.NewOciClientWithOpts(
+		oci.WithCredential(cred),
+		oci.WithRepoPath(repoPath),
+		oci.WithSettings(c.GetSettings()),
+	)
+
+	if err != nil {
+		return "", err
+	}
+
+	return ociClient.TheLatestTag()
+}
+
+func (c *KpmClient) downloadPkg(options ...downloader.Option) (*pkg.KclPkg, error) {
+	opts := downloader.DownloadOptions{}
+	for _, option := range options {
+		option(&opts)
+	}
+
+	localPath := opts.LocalPath
+	tmpDir, err := os.MkdirTemp("", "")
+	if err != nil {
+		return nil, err
+	}
+	tmpDir = filepath.Join(tmpDir, constants.GitScheme)
+	// clean the temp dir.
+	defer os.RemoveAll(tmpDir)
+	err = c.DepDownloader.Download(*downloader.NewDownloadOptions(
+		downloader.WithLocalPath(tmpDir),
+		downloader.WithSource(opts.Source),
+		downloader.WithLogWriter(c.GetLogWriter()),
+		downloader.WithSettings(*c.GetSettings()),
+	))
+
+	if err != nil {
+		return nil, err
+	}
+
+	if utils.DirExists(localPath) {
+		err := os.RemoveAll(localPath)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	if dep.Source.Oci != nil {
-		localPath, err := c.DownloadFromOci(dep.Source.Oci, localPath)
+	destDir := filepath.Dir(localPath)
+	if !utils.DirExists(destDir) {
+		err = os.MkdirAll(destDir, os.ModePerm)
 		if err != nil {
 			return nil, err
 		}
-		dep.Version = dep.Source.Oci.Tag
+	}
+
+	err = utils.MoveFile(tmpDir, localPath)
+	if err != nil {
+		return nil, err
+	}
+
+	localPath, err = filepath.Abs(localPath)
+	if err != nil {
+		return nil, err
+	}
+
+	pkg, err := c.LoadPkgFromPath(localPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return pkg, nil
+}
+
+// Download will download the dependency to the local path.
+func (c *KpmClient) Download(dep *pkg.Dependency, homePath, localPath string) (*pkg.Dependency, error) {
+	if dep.Source.Git != nil {
+		err := c.DepDownloader.Download(*downloader.NewDownloadOptions(
+			downloader.WithLocalPath(localPath),
+			downloader.WithSource(dep.Source),
+			downloader.WithLogWriter(c.logWriter),
+			downloader.WithSettings(c.settings),
+		))
+		if err != nil {
+			return nil, err
+		}
+
 		dep.LocalFullPath = localPath
 		// Creating symbolic links in a global cache is not an optimal solution.
 		// This allows kclvm to locate the package by default.
 		// This feature is unstable and will be removed soon.
-		err = createDepRef(dep.LocalFullPath, filepath.Join(filepath.Dir(localPath), dep.Name))
+		// err = createDepRef(dep.LocalFullPath, filepath.Join(filepath.Dir(localPath), dep.Name))
+		// if err != nil {
+		//     return nil, err
+		// }
+		dep.FullName = dep.GenDepFullName()
+
+		modFile, err := c.LoadModFile(localPath)
 		if err != nil {
 			return nil, err
 		}
-		dep.FullName = dep.GenDepFullName()
+		dep.Version = modFile.Pkg.Version
+	}
+
+	if dep.Source.Oci != nil || dep.Source.Registry != nil {
+		var ociSource *downloader.Oci
+		if dep.Source.Oci != nil {
+			ociSource = dep.Source.Oci
+		} else if dep.Source.Registry != nil {
+			ociSource = dep.Source.Registry.Oci
+		}
+		// Select the latest tag, if the tag, the user inputed, is empty.
+		if ociSource.Tag == "" || ociSource.Tag == constants.LATEST {
+			latestTag, err := c.AcquireTheLatestOciVersion(*ociSource)
+			if err != nil {
+				return nil, err
+			}
+			ociSource.Tag = latestTag
+
+			if dep.Source.Registry != nil {
+				dep.Source.Registry.Tag = latestTag
+			}
+
+			// Complete some information that the local three dependencies depend on.
+			// The invalid path such as '$HOME/.kcl/kpm/k8s_' is placed because the version field is missing.
+			dep.Version = latestTag
+			dep.FullName = dep.GenDepFullName()
+			dep.LocalFullPath = filepath.Join(filepath.Dir(localPath), dep.FullName)
+			localPath = dep.LocalFullPath
+
+			if utils.DirExists(dep.LocalFullPath) {
+				dpkg, err := c.LoadPkgFromPath(localPath)
+				if err != nil {
+					// If the package is invalid, delete it and re-download it.
+					err := os.RemoveAll(dep.LocalFullPath)
+					if err != nil {
+						return nil, err
+					}
+				} else {
+					dep.FromKclPkg(dpkg)
+					return dep, nil
+				}
+			}
+		}
+
+		// create a tmp dir to download the oci package.
+		tmpDir, err := os.MkdirTemp("", "")
+		if err != nil {
+			return nil, reporter.NewErrorEvent(reporter.Bug, err, fmt.Sprintf("failed to create temp dir '%s'.", tmpDir))
+		}
+		// clean the temp dir.
+		defer os.RemoveAll(tmpDir)
+
+		credCli, err := c.GetCredsClient()
+		if err != nil {
+			return nil, err
+		}
+		err = c.DepDownloader.Download(*downloader.NewDownloadOptions(
+			downloader.WithLocalPath(tmpDir),
+			downloader.WithSource(dep.Source),
+			downloader.WithLogWriter(c.logWriter),
+			downloader.WithSettings(c.settings),
+			downloader.WithCredsClient(credCli),
+		))
+		if err != nil {
+			return nil, err
+		}
+
+		// check the package in tmp dir is a valid kcl package.
+		_, err = pkg.FindFirstKclPkgFrom(tmpDir)
+		if err != nil {
+			return nil, err
+		}
+
+		// rename the tmp dir to the local path.
+		if utils.DirExists(localPath) {
+			err := os.RemoveAll(localPath)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if runtime.GOOS != "windows" {
+			err = os.Rename(tmpDir, localPath)
+			if err != nil {
+				// check the error is caused by moving the file across file systems.
+				if goerr.Is(err, syscall.EXDEV) {
+					// If it is, use copy as a fallback.
+					err = copy.Copy(tmpDir, localPath)
+					if err != nil {
+						return nil, err
+					}
+				} else {
+					return nil, err
+				}
+			}
+		} else {
+			err = copy.Copy(tmpDir, localPath)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// load the package from the local path.
+		dpkg, err := c.LoadPkgFromPath(localPath)
+		if err != nil {
+			return nil, err
+		}
+
+		dep.FromKclPkg(dpkg)
+		dep.Sum, err = c.AcquireDepSum(*dep)
+		if err != nil {
+			return nil, err
+		}
+		if dep.Sum == "" {
+			dep.Sum, err = utils.HashDir(localPath)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if dep.LocalFullPath == "" {
+			dep.LocalFullPath = localPath
+		}
+
+		if localPath != dep.LocalFullPath {
+			err = os.Rename(localPath, dep.LocalFullPath)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Creating symbolic links in a global cache is not an optimal solution.
+		// This allows kclvm to locate the package by default.
+		// This feature is unstable and will be removed soon.
+		// err = createDepRef(dep.LocalFullPath, filepath.Join(filepath.Dir(localPath), dep.Name))
+		// if err != nil {
+		//     return nil, err
+		// }
 	}
 
 	if dep.Source.Local != nil {
-		dep.LocalFullPath = dep.Source.Local.Path
-	}
-
-	var err error
-	dep.Sum, err = utils.HashDir(dep.LocalFullPath)
-	if err != nil {
-		return nil, reporter.NewErrorEvent(
-			reporter.FailedHashPkg,
-			err,
-			fmt.Sprintf("failed to hash the kcl package '%s' in '%s'.", dep.Name, dep.LocalFullPath),
-		)
+		kpkg, err := pkg.FindFirstKclPkgFrom(c.getDepStorePath(homePath, dep, false))
+		if err != nil {
+			return nil, err
+		}
+		dep.FromKclPkg(kpkg)
 	}
 
 	return dep, nil
 }
 
 // DownloadFromGit will download the dependency from the git repository.
-func (c *KpmClient) DownloadFromGit(dep *pkg.Git, localPath string) (string, error) {
+func (c *KpmClient) DownloadFromGit(dep *downloader.Git, localPath string) (string, error) {
 	var msg string
 	if len(dep.Tag) != 0 {
 		msg = fmt.Sprintf("with tag '%s'", dep.Tag)
@@ -829,6 +1275,10 @@ func (c *KpmClient) DownloadFromGit(dep *pkg.Git, localPath string) (string, err
 
 	if len(dep.Commit) != 0 {
 		msg = fmt.Sprintf("with commit '%s'", dep.Commit)
+	}
+
+	if len(dep.Branch) != 0 {
+		msg = fmt.Sprintf("with branch '%s'", dep.Branch)
 	}
 
 	reporter.ReportMsgTo(
@@ -898,8 +1348,66 @@ func (c *KpmClient) ParseKclModFile(kclPkg *pkg.KclPkg) (map[string]map[string]s
 	return dependencies, nil
 }
 
+// LoadPkgFromOci will download the kcl package from the oci repository and return an `KclPkg`.
+func (c *KpmClient) DownloadPkgFromOci(dep *downloader.Oci, localPath string) (*pkg.KclPkg, error) {
+	repoPath := utils.JoinPath(dep.Reg, dep.Repo)
+	cred, err := c.GetCredentials(dep.Reg)
+	if err != nil {
+		return nil, err
+	}
+
+	ociClient, err := oci.NewOciClientWithOpts(
+		oci.WithCredential(cred),
+		oci.WithRepoPath(repoPath),
+		oci.WithSettings(c.GetSettings()),
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	ociClient.SetLogWriter(c.logWriter)
+	// Select the latest tag, if the tag, the user inputed, is empty.
+	var tagSelected string
+	if len(dep.Tag) == 0 {
+		tagSelected, err = ociClient.TheLatestTag()
+		if err != nil {
+			return nil, err
+		}
+
+		reporter.ReportMsgTo(
+			fmt.Sprintf("the lastest version '%s' will be added", tagSelected),
+			c.logWriter,
+		)
+
+		dep.Tag = tagSelected
+		localPath = localPath + dep.Tag
+	} else {
+		tagSelected = dep.Tag
+	}
+
+	reporter.ReportMsgTo(
+		fmt.Sprintf("downloading '%s:%s' from '%s/%s:%s'", dep.Repo, tagSelected, dep.Reg, dep.Repo, tagSelected),
+		c.logWriter,
+	)
+
+	// Pull the package with the tag.
+	err = ociClient.Pull(localPath, tagSelected)
+	if err != nil {
+		return nil, err
+	}
+
+	pkg, err := pkg.FindFirstKclPkgFrom(localPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return pkg, nil
+}
+
 // DownloadFromOci will download the dependency from the oci repository.
-func (c *KpmClient) DownloadFromOci(dep *pkg.Oci, localPath string) (string, error) {
+// Deprecated: Use the DownloadPkgFromOci instead.
+func (c *KpmClient) DownloadFromOci(dep *downloader.Oci, localPath string) (string, error) {
 	ociClient, err := oci.NewOciClient(dep.Reg, dep.Repo, &c.settings)
 	if err != nil {
 		return "", err
@@ -935,30 +1443,30 @@ func (c *KpmClient) DownloadFromOci(dep *pkg.Oci, localPath string) (string, err
 		return "", err
 	}
 
-	matches, finderr := filepath.Glob(filepath.Join(localPath, "*.tar"))
-	if finderr != nil || len(matches) != 1 {
-		if finderr == nil {
-			err = reporter.NewErrorEvent(
+	matches, _ := filepath.Glob(filepath.Join(localPath, "*.tar"))
+	if matches == nil || len(matches) != 1 {
+		// then try to glob tgz file
+		matches, _ = filepath.Glob(filepath.Join(localPath, "*.tgz"))
+		if matches == nil || len(matches) != 1 {
+			return "", reporter.NewErrorEvent(
 				reporter.InvalidKclPkg,
 				err,
-				fmt.Sprintf("failed to find the kcl package tar from '%s'.", localPath),
+				fmt.Sprintf("failed to find the kcl package from '%s'.", localPath),
 			)
 		}
-
-		return "", reporter.NewErrorEvent(
-			reporter.InvalidKclPkg,
-			err,
-			fmt.Sprintf("failed to find the kcl package tar from '%s'.", localPath),
-		)
 	}
 
 	tarPath := matches[0]
-	untarErr := utils.UnTarDir(tarPath, localPath)
-	if untarErr != nil {
+	if utils.IsTar(tarPath) {
+		err = utils.UnTarDir(tarPath, localPath)
+	} else {
+		err = utils.ExtractTarball(tarPath, localPath)
+	}
+	if err != nil {
 		return "", reporter.NewErrorEvent(
 			reporter.FailedUntarKclPkg,
-			untarErr,
-			fmt.Sprintf("failed to untar the kcl package tar from '%s' into '%s'.", tarPath, localPath),
+			err,
+			fmt.Sprintf("failed to untar the kcl package from '%s' into '%s'.", tarPath, localPath),
 		)
 	}
 
@@ -1015,7 +1523,7 @@ func (c *KpmClient) PullFromOci(localPath, source, tag string) error {
 	// clean the temp dir.
 	defer os.RemoveAll(tmpDir)
 
-	storepath := ociOpts.AddStoragePathSuffix(tmpDir)
+	storepath := ociOpts.SanitizePathWithSuffix(tmpDir)
 	err = c.pullTarFromOci(storepath, ociOpts)
 	if err != nil {
 		return err
@@ -1037,7 +1545,7 @@ func (c *KpmClient) PullFromOci(localPath, source, tag string) error {
 	}
 
 	// Untar the tar file.
-	storagePath := ociOpts.AddStoragePathSuffix(localPath)
+	storagePath := ociOpts.SanitizePathWithSuffix(localPath)
 	err = utils.UnTarDir(matches[0], storagePath)
 	if err != nil {
 		return reporter.NewErrorEvent(
@@ -1056,7 +1564,18 @@ func (c *KpmClient) PullFromOci(localPath, source, tag string) error {
 
 // PushToOci will push a kcl package to oci registry.
 func (c *KpmClient) PushToOci(localPath string, ociOpts *opt.OciOptions) error {
-	ociCli, err := oci.NewOciClient(ociOpts.Reg, ociOpts.Repo, &c.settings)
+	repoPath := utils.JoinPath(ociOpts.Reg, ociOpts.Repo)
+	cred, err := c.GetCredentials(ociOpts.Reg)
+	if err != nil {
+		return err
+	}
+
+	ociCli, err := oci.NewOciClientWithOpts(
+		oci.WithCredential(cred),
+		oci.WithRepoPath(repoPath),
+		oci.WithSettings(c.GetSettings()),
+	)
+
 	if err != nil {
 		return err
 	}
@@ -1082,12 +1601,46 @@ func (c *KpmClient) PushToOci(localPath string, ociOpts *opt.OciOptions) error {
 
 // LoginOci will login to the oci registry.
 func (c *KpmClient) LoginOci(hostname, username, password string) error {
-	return oci.Login(hostname, username, password, &c.settings)
+
+	credCli, err := c.GetCredsClient()
+	if err != nil {
+		return err
+	}
+
+	err = credCli.GetAuthClient().LoginWithOpts(
+		[]auth.LoginOption{
+			auth.WithLoginHostname(hostname),
+			auth.WithLoginUsername(username),
+			auth.WithLoginSecret(password),
+		}...,
+	)
+
+	if err != nil {
+		return reporter.NewErrorEvent(
+			reporter.FailedLogin,
+			err,
+			fmt.Sprintf("failed to login '%s', please check registry, username and password is valid", hostname),
+		)
+	}
+
+	return nil
 }
 
 // LogoutOci will logout from the oci registry.
 func (c *KpmClient) LogoutOci(hostname string) error {
-	return oci.Logout(hostname, &c.settings)
+
+	credCli, err := c.GetCredsClient()
+	if err != nil {
+		return err
+	}
+
+	err = credCli.GetAuthClient().Logout(context.Background(), hostname)
+
+	if err != nil {
+		return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
+	}
+
+	return nil
 }
 
 // ParseOciRef will parser '<repo_name>:<repo_tag>' into an 'OciOptions'.
@@ -1144,18 +1697,21 @@ func (c *KpmClient) ParseOciOptionFromString(oci string, tag string) (*opt.OciOp
 }
 
 // InitGraphAndDownloadDeps initializes a dependency graph and call downloadDeps function.
-func (c *KpmClient) InitGraphAndDownloadDeps(kclPkg *pkg.KclPkg) (*pkg.Dependencies, graph.Graph[string, string], error) {
+func (c *KpmClient) InitGraphAndDownloadDeps(kclPkg *pkg.KclPkg) (*pkg.Dependencies, graph.Graph[module.Version, module.Version], error) {
 
-	depGraph := graph.New(graph.StringHash, graph.Directed(), graph.PreventCycles())
+	moduleHash := func(m module.Version) module.Version {
+		return m
+	}
+	depGraph := graph.New(moduleHash, graph.Directed(), graph.PreventCycles())
 
 	// add the root vertex(package name) to the dependency graph.
-	root := fmt.Sprintf("%s@%s", kclPkg.GetPkgName(), kclPkg.GetPkgVersion())
+	root := module.Version{Path: kclPkg.GetPkgName(), Version: kclPkg.GetPkgVersion()}
 	err := depGraph.AddVertex(root)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	changedDeps, err := c.downloadDeps(kclPkg.ModFile.Dependencies, kclPkg.Dependencies, depGraph, root)
+	changedDeps, err := c.DownloadDeps(&kclPkg.ModFile.Dependencies, &kclPkg.Dependencies, depGraph, kclPkg.HomePath, root)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1164,131 +1720,158 @@ func (c *KpmClient) InitGraphAndDownloadDeps(kclPkg *pkg.KclPkg) (*pkg.Dependenc
 }
 
 // dependencyExists will check whether the dependency exists in the local filesystem.
-func (c *KpmClient) dependencyExists(dep *pkg.Dependency, lockDeps *pkg.Dependencies) *pkg.Dependency {
-
+func (c *KpmClient) dependencyExistsLocal(searchPath string, dep *pkg.Dependency) (*pkg.Dependency, error) {
 	// If the flag '--no_sum_check' is set, skip the checksum check.
-	if c.noSumCheck {
-		// If the dependent package does exist locally
-		if utils.DirExists(filepath.Join(c.homePath, dep.FullName)) {
-			return dep
+	deppath := c.getDepStorePath(searchPath, dep, false)
+	if utils.DirExists(deppath) {
+		depPkg, err := c.LoadPkgFromPath(deppath)
+		if err != nil {
+			return nil, err
 		}
+		dep.FromKclPkg(depPkg)
+		return dep, nil
 	}
-
-	lockDep, present := lockDeps.Deps[dep.Name]
-	// Check if the sum of this dependency in kcl.mod.lock has been changed.
-	if !c.noSumCheck && present {
-		// If the dependent package does not exist locally, then method 'check' will return false.
-		if c.noSumCheck || check(lockDep, filepath.Join(c.homePath, dep.FullName)) {
-			return dep
-		}
-	}
-
-	return nil
+	return nil, nil
 }
 
 // downloadDeps will download all the dependencies of the current kcl package.
-func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencies, depGraph graph.Graph[string, string], parent string) (*pkg.Dependencies, error) {
+func (c *KpmClient) DownloadDeps(deps *pkg.Dependencies, lockDeps *pkg.Dependencies, depGraph graph.Graph[module.Version, module.Version], pkghome string, parent module.Version) (*pkg.Dependencies, error) {
+
 	newDeps := pkg.Dependencies{
-		Deps: make(map[string]pkg.Dependency),
+		Deps: orderedmap.NewOrderedMap[string, pkg.Dependency](),
 	}
 
 	// Traverse all dependencies in kcl.mod
-	for _, d := range deps.Deps {
+	for _, k := range deps.Deps.Keys() {
+		d, _ := deps.Deps.Get(k)
 		if len(d.Name) == 0 {
 			return nil, errors.InvalidDependency
 		}
 
-		existDep := c.dependencyExists(&d, &lockDeps)
-		if existDep != nil {
-			newDeps.Deps[d.Name] = *existDep
+		existDep, err := c.dependencyExistsLocal(pkghome, &d)
+		if existDep != nil && err == nil {
+			newDeps.Deps.Set(d.Name, *existDep)
 			continue
 		}
 
-		expectedSum := lockDeps.Deps[d.Name].Sum
+		expectedSum := lockDeps.Deps.GetOrDefault(d.Name, pkg.TestPkgDependency).Sum
 		// Clean the cache
 		if len(c.homePath) == 0 || len(d.FullName) == 0 {
 			return nil, errors.InternalBug
 		}
-		dir := filepath.Join(c.homePath, d.FullName)
-		os.RemoveAll(dir)
 
-		// download dependencies
-		lockedDep, err := c.Download(&d, dir)
+		dir := c.getDepStorePath(c.homePath, &d, false)
+		err = os.RemoveAll(dir)
 		if err != nil {
 			return nil, err
 		}
 
-		if !lockedDep.IsFromLocal() {
+		// download dependencies
+		lockedDep, err := c.Download(&d, pkghome, dir)
+		if err != nil {
+			return nil, err
+		}
+
+		if lockedDep.Oci != nil && lockedDep.Equals(lockDeps.Deps.GetOrDefault(d.Name, pkg.TestPkgDependency)) {
 			if !c.noSumCheck && expectedSum != "" &&
-				lockedDep.Sum != expectedSum &&
-				existDep != nil &&
-				existDep.FullName == d.FullName {
+				lockedDep.Sum != "" &&
+				lockedDep.Sum != expectedSum {
 				return nil, reporter.NewErrorEvent(
 					reporter.CheckSumMismatch,
 					errors.CheckSumMismatchError,
-					fmt.Sprintf("checksum for '%s' changed in lock file", lockedDep.Name),
+					fmt.Sprintf("checksum for '%s' changed in lock file '%s' and '%s'", lockedDep.Name, expectedSum, lockedDep.Sum),
 				)
+			} else {
+				lockedDep.Sum = lockDeps.Deps.GetOrDefault(d.Name, pkg.Dependency{}).Sum
 			}
 		}
 
-		// Update kcl.mod and kcl.mod.lock
-		newDeps.Deps[d.Name] = *lockedDep
-		lockDeps.Deps[d.Name] = *lockedDep
+		newDeps.Deps.Set(d.Name, *lockedDep)
+		// After downloading the dependency in kcl.mod, update the dep into to the kcl.mod
+		// Only the direct dependencies are updated to kcl.mod.
+		deps.Deps.Set(d.Name, *lockedDep)
 	}
 
 	// necessary to make a copy as when we are updating kcl.mod in below for loop
 	// then newDeps.Deps gets updated and range gets an extra value to iterate through
 	// this messes up the dependency graph
-	newDepsCopy := make(map[string]pkg.Dependency)
-	for k, v := range newDeps.Deps {
-		newDepsCopy[k] = v
+	newDepsCopy := orderedmap.NewOrderedMap[string, pkg.Dependency]()
+	for _, k := range newDeps.Deps.Keys() {
+		v, ok := newDeps.Deps.Get(k)
+		if !ok {
+			break
+		}
+		newDepsCopy.Set(k, v)
 	}
 
 	// Recursively download the dependencies of the new dependencies.
-	for _, d := range newDepsCopy {
-		// Load kcl.mod file of the new downloaded dependencies.
-		deppkg, err := pkg.LoadKclPkg(filepath.Join(c.homePath, d.FullName))
-		if len(d.LocalFullPath) != 0 {
-			deppkg, err = pkg.LoadKclPkg(d.LocalFullPath)
+	for _, k := range newDepsCopy.Keys() {
+		d, ok := newDepsCopy.Get(k)
+		if !ok {
+			break
 		}
+		var err error
+		var deppkg *pkg.KclPkg
+		if len(d.LocalFullPath) != 0 {
+			deppkg, err = c.LoadPkgFromPath(d.LocalFullPath)
+		} else {
+			// Load kcl.mod file of the new downloaded dependencies.
+			deppkg, err = c.LoadPkgFromPath(filepath.Join(c.homePath, d.FullName))
 
+		}
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
 			return nil, err
 		}
-		source := fmt.Sprintf("%s@%s", d.Name, d.Version)
-		source = strings.TrimRight(source, "@")
-		err = depGraph.AddVertex(source)
+
+		source := module.Version{Path: d.Name, Version: d.Version}
+
+		err = depGraph.AddVertex(source, graph.VertexAttribute(d.GetSourceType(), d.GetDownloadPath()))
 		if err != nil && err != graph.ErrVertexAlreadyExists {
 			return nil, err
 		}
 
-		err = depGraph.AddEdge(parent, source)
-		if err != nil {
-			if err == graph.ErrEdgeCreatesCycle {
-				return nil, reporter.NewErrorEvent(
-					reporter.CircularDependencyExist,
-					nil,
-					fmt.Sprintf("adding %s as a dependency results in a cycle", source),
-				)
+		if parent != (module.Version{}) {
+			err = depGraph.AddEdge(parent, source)
+			if err != nil {
+				if err == graph.ErrEdgeCreatesCycle {
+					return nil, reporter.NewErrorEvent(
+						reporter.CircularDependencyExist,
+						nil,
+						fmt.Sprintf("adding %s as a dependency results in a cycle", source),
+					)
+				}
+				return nil, err
 			}
+		}
+
+		// Download the indirect dependencies.
+		nested, err := c.DownloadDeps(&deppkg.ModFile.Dependencies, lockDeps, depGraph, deppkg.HomePath, source)
+		if err != nil {
 			return nil, err
 		}
 
-		// Download the dependencies.
-		nested, err := c.downloadDeps(deppkg.ModFile.Dependencies, lockDeps, depGraph, source)
-		if err != nil {
-			return nil, err
-		}
-
-		// Update kcl.mod.
-		for _, d := range nested.Deps {
-			if _, ok := newDeps.Deps[d.Name]; !ok {
-				newDeps.Deps[d.Name] = d
+		for _, k := range nested.Deps.Keys() {
+			d, ok := nested.Deps.Get(k)
+			if !ok {
+				break
+			}
+			if _, ok := newDeps.Deps.Get(d.Name); !ok {
+				newDeps.Deps.Set(d.Name, d)
 			}
 		}
+	}
+
+	// After each dependency is downloaded, update all the new deps to kcl.mod.lock.
+	// No matter whether the dependency is directly or indirectly.
+	for _, k := range newDeps.Deps.Keys() {
+		v, ok := newDeps.Deps.Get(k)
+		if !ok {
+			break
+		}
+		lockDeps.Deps.Set(k, v)
 	}
 
 	return &newDeps, nil
@@ -1301,7 +1884,18 @@ func (c *KpmClient) pullTarFromOci(localPath string, ociOpts *opt.OciOptions) er
 		return reporter.NewErrorEvent(reporter.Bug, err)
 	}
 
-	ociCli, err := oci.NewOciClient(ociOpts.Reg, ociOpts.Repo, &c.settings)
+	repoPath := utils.JoinPath(ociOpts.Reg, ociOpts.Repo)
+	cred, err := c.GetCredentials(ociOpts.Reg)
+	if err != nil {
+		return err
+	}
+
+	ociCli, err := oci.NewOciClientWithOpts(
+		oci.WithCredential(cred),
+		oci.WithRepoPath(repoPath),
+		oci.WithSettings(c.GetSettings()),
+	)
+
 	if err != nil {
 		return err
 	}
@@ -1338,7 +1932,19 @@ func (c *KpmClient) pullTarFromOci(localPath string, ociOpts *opt.OciOptions) er
 
 // FetchOciManifestConfIntoJsonStr will fetch the oci manifest config of the kcl package from the oci registry and return it into json string.
 func (c *KpmClient) FetchOciManifestIntoJsonStr(opts opt.OciFetchOptions) (string, error) {
-	ociCli, err := oci.NewOciClient(opts.Reg, opts.Repo, &c.settings)
+
+	repoPath := utils.JoinPath(opts.Reg, opts.Repo)
+	cred, err := c.GetCredentials(opts.Reg)
+	if err != nil {
+		return "", err
+	}
+
+	ociCli, err := oci.NewOciClientWithOpts(
+		oci.WithCredential(cred),
+		oci.WithRepoPath(repoPath),
+		oci.WithSettings(c.GetSettings()),
+	)
+
 	if err != nil {
 		return "", err
 	}
@@ -1350,34 +1956,19 @@ func (c *KpmClient) FetchOciManifestIntoJsonStr(opts opt.OciFetchOptions) (strin
 	return manifestJson, nil
 }
 
-// check sum for a Dependency.
-func check(dep pkg.Dependency, newDepPath string) bool {
-	if dep.Sum == "" {
-		return false
-	}
-
-	sum, err := utils.HashDir(newDepPath)
-
-	if err != nil {
-		return false
-	}
-
-	return dep.Sum == sum
-}
-
 // createDepRef will create a dependency reference for the dependency saved on the local filesystem.
 // On the unix-like system, it will create a symbolic link.
 // On the windows system, it will create a junction.
-func createDepRef(depName, refName string) error {
-	if runtime.GOOS == "windows" {
-		// 'go-getter' continuously occupies files in '.git', causing the copy operation to fail
-		opt := copy.Options{
-			Skip: func(srcinfo os.FileInfo, src, dest string) (bool, error) {
-				return filepath.Base(src) == constants.GitPathSuffix, nil
-			},
-		}
-		return copy.Copy(depName, refName, opt)
-	} else {
-		return utils.CreateSymlink(depName, refName)
-	}
-}
+// func createDepRef(depName, refName string) error {
+// 	if runtime.GOOS == "windows" {
+// 		// 'go-getter' continuously occupies files in '.git', causing the copy operation to fail
+// 		opt := copy.Options{
+// 			Skip: func(srcinfo os.FileInfo, src, dest string) (bool, error) {
+// 				return filepath.Base(src) == constants.GitPathSuffix, nil
+// 			},
+// 		}
+// 		return copy.Copy(depName, refName, opt)
+// 	} else {
+// 		return utils.CreateSymlink(depName, refName)
+// 	}
+// }

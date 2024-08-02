@@ -1,8 +1,12 @@
 package utils
 
 import (
+	"archive/tar"
+	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -75,9 +79,67 @@ func TestTarDir(t *testing.T) {
 		os.Remove(tarPath)
 	}
 
-	err = TarDir(filepath.Join(testDir, "test_src"), tarPath)
-	assert.Equal(t, err, nil)
+	testSrcDir := filepath.Join(testDir, "test_src")
 
+	getTarFileNames := func(filePath string) ([]string, error) {
+		file, err := os.Open(filePath)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+
+		reader := tar.NewReader(file)
+		filePaths := []string{}
+
+		for {
+			header, err := reader.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			if header.Typeflag != tar.TypeReg {
+				continue
+			}
+
+			fullPath := path.Join(header.Name)
+			fullPath = path.Join(filePath, fullPath)
+			fullPath = strings.Replace(fullPath, "test.tar", "test_src", 1)
+
+			filePaths = append(filePaths, fullPath)
+		}
+
+		return filePaths, nil
+	}
+
+	getNewPattern := func(ex string) string {
+		return testSrcDir + "/" + ex
+	}
+
+	err = TarDir(testSrcDir, tarPath, []string{}, []string{})
+	assert.Equal(t, err, nil)
+	_, err = os.Stat(tarPath)
+	assert.Equal(t, err, nil)
+	os.Remove(tarPath)
+
+	_ = TarDir(testSrcDir, tarPath, []string{}, []string{"*.mod"})
+	fileNames, _ := getTarFileNames(tarPath)
+	for _, fileName := range fileNames {
+		flag, _ := filepath.Match(getNewPattern("*.mod"), fileName)
+		assert.Equal(t, flag, false)
+	}
+	_, err = os.Stat(tarPath)
+	assert.Equal(t, err, nil)
+	os.Remove(tarPath)
+
+	_ = TarDir(testSrcDir, tarPath, []string{"*/*.lock", "*.mod"}, []string{})
+	fileNames, _ = getTarFileNames(tarPath)
+	for _, fileName := range fileNames {
+		flag, _ := filepath.Match(getNewPattern("*/*.lock"), fileName)
+		assert.Equal(t, flag, true)
+	}
 	_, err = os.Stat(tarPath)
 	assert.Equal(t, err, nil)
 	os.Remove(tarPath)
@@ -191,4 +253,52 @@ func TestAbsTarPath(t *testing.T) {
 	abs, err = AbsTarPath(filepath.Join(pkgPath, "invalid_tar"))
 	assert.NotEqual(t, err, nil)
 	assert.Equal(t, abs, "")
+}
+
+func TestIsSymlinkExist(t *testing.T) {
+	testPath := filepath.Join(getTestDir("test_link"), "is_link_exist")
+
+	link_target_not_exist := filepath.Join(testPath, "link_target_not_exist")
+
+	linkExist, targetExist, err := IsSymlinkValidAndExists(link_target_not_exist)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, linkExist, true)
+	assert.Equal(t, targetExist, false)
+
+	linkExist, targetExist, err = IsSymlinkValidAndExists("invalid_link")
+	assert.Equal(t, err, nil)
+	assert.Equal(t, linkExist, false)
+	assert.Equal(t, targetExist, false)
+
+	filename := filepath.Join(testPath, "test.txt")
+	validLink := filepath.Join(testPath, "valid_link")
+	err = CreateSymlink(filename, validLink)
+	assert.Equal(t, err, nil)
+
+	linkExist, targetExist, err = IsSymlinkValidAndExists(validLink)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, linkExist, true)
+	assert.Equal(t, targetExist, true)
+
+	anotherValidLink := filepath.Join(testPath, "another_valid_link")
+	err = CreateSymlink(filename, anotherValidLink)
+	assert.Equal(t, err, nil)
+
+	linkExist, targetExist, err = IsSymlinkValidAndExists(anotherValidLink)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, linkExist, true)
+	assert.Equal(t, targetExist, true)
+	// Defer the removal of the symlink
+	defer func() {
+		err := os.Remove(anotherValidLink)
+		assert.Equal(t, err, nil)
+		err = os.Remove(validLink)
+		assert.Equal(t, err, nil)
+	}()
+}
+
+func TestIsModRelativePath(t *testing.T) {
+	assert.Equal(t, IsModRelativePath("${KCL_MOD}/aaa"), true)
+	assert.Equal(t, IsModRelativePath("${helloworld:KCL_MOD}/aaa"), true)
+	assert.Equal(t, IsModRelativePath("xxx/xxx/xxx"), false)
 }

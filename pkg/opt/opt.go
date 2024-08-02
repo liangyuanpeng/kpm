@@ -3,16 +3,22 @@
 package opt
 
 import (
+	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/hashicorp/go-version"
 	"kcl-lang.io/kcl-go/pkg/kcl"
+	"kcl-lang.io/kpm/pkg/constants"
 	"kcl-lang.io/kpm/pkg/errors"
+	"kcl-lang.io/kpm/pkg/path"
 	"kcl-lang.io/kpm/pkg/reporter"
+	"kcl-lang.io/kpm/pkg/settings"
 	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/registry"
 )
 
 // CompileOptions is the input options of 'kpm run'.
@@ -165,6 +171,7 @@ func (opts *InitOptions) Validate() error {
 
 type AddOptions struct {
 	LocalPath    string
+	NewPkgName   string
 	RegistryOpts RegistryOptions
 	NoSumCheck   bool
 }
@@ -183,9 +190,191 @@ func (opts *AddOptions) Validate() error {
 }
 
 type RegistryOptions struct {
-	Git   *GitOptions
-	Oci   *OciOptions
-	Local *LocalOptions
+	Git      *GitOptions
+	Oci      *OciOptions
+	Local    *LocalOptions
+	Registry *OciOptions
+}
+
+// NewRegistryOptionsFrom will parse the registry options from oci url, oci ref and git url.
+// If you do not know the url of the package is git or oci, you can use this function to parse the options.
+// By default:
+// 'git://', "https://", "http://" will be parsed as git options.
+// 'oci://', will be parsed as oci options.
+// 'file://' or a file path will be parsed as local options.
+//
+// If you know the url is git or oci, you can use 'NewGitOptionsFromUrl' or 'NewOciOptionsFromUrl' to parse the options.
+// 'oci' and 'http', 'https' are supported for 'NewOciOptionsFromUrl'.
+// 'git', 'http', 'https', 'ssh' are supported for 'NewGitOptionsFromUrl'.
+func NewRegistryOptionsFrom(rawUrlorOciRef string, settings *settings.Settings) (*RegistryOptions, error) {
+	parsedUrl, err := url.Parse(rawUrlorOciRef)
+	if err != nil {
+		return nil, err
+	}
+
+	// parse the options from the local file path
+	if parsedUrl.Scheme == "" || parsedUrl.Scheme == constants.FileEntry {
+		localOptions, err := NewLocalOptionsFromUrl(parsedUrl)
+		if localOptions != nil && err == (*reporter.KpmEvent)(nil) {
+			return &RegistryOptions{
+				Local: localOptions,
+			}, nil
+		}
+	}
+
+	// parse the options from the git url
+	// https, http, git and ssh are supported
+	if parsedUrl.Scheme == constants.GitScheme ||
+		parsedUrl.Scheme == constants.HttpScheme ||
+		parsedUrl.Scheme == constants.HttpsScheme ||
+		parsedUrl.Scheme == constants.SshScheme {
+		gitOptions := NewGitOptionsFromUrl(parsedUrl)
+
+		if gitOptions != nil {
+			return &RegistryOptions{
+				Git: gitOptions,
+			}, nil
+		}
+	}
+
+	// parse the options from the oci url
+	// oci is supported
+	if parsedUrl.Scheme == constants.OciScheme ||
+		parsedUrl.Scheme == constants.HttpScheme ||
+		parsedUrl.Scheme == constants.HttpsScheme {
+		ociOptions := NewOciOptionsFromUrl(parsedUrl)
+
+		if ociOptions != nil {
+			return &RegistryOptions{
+				Oci: ociOptions,
+			}, nil
+		}
+	}
+
+	// If all the url are invalid, try to parse the options from the oci ref.
+	ociOptions, err := NewOciOptionsFromRef(rawUrlorOciRef, settings)
+	if err != nil {
+		return nil, err
+	}
+
+	if ociOptions != nil {
+		return &RegistryOptions{
+			Registry: ociOptions,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("invalid dependencies source: %s", rawUrlorOciRef)
+}
+
+// NewGitOptionsFromUrl will parse the git options from the git url.
+// https, http, git and ssh are supported.
+func NewGitOptionsFromUrl(parsedUrl *url.URL) *GitOptions {
+	if parsedUrl.Scheme == "" || parsedUrl.Scheme == constants.GitScheme {
+		// go-getter do not supports git scheme, so we need to convert it to https scheme.
+		parsedUrl.Scheme = constants.HttpsScheme
+	}
+
+	commit := parsedUrl.Query().Get(constants.GitCommit)
+	branch := parsedUrl.Query().Get(constants.GitBranch)
+	tag := parsedUrl.Query().Get(constants.Tag)
+
+	// clean the query in git url
+	parsedUrl.RawQuery = ""
+	url := parsedUrl.String()
+
+	return &GitOptions{
+		Url:    url,
+		Branch: branch,
+		Commit: commit,
+		Tag:    tag,
+	}
+}
+
+// NewOciOptionsFromUrl will parse the oci options from the oci url.
+// https, http, oci is supported.
+func NewOciOptionsFromUrl(parsedUrl *url.URL) *OciOptions {
+	if parsedUrl.Scheme == "" {
+		parsedUrl.Scheme = constants.HttpsScheme
+	}
+	return &OciOptions{
+		Reg:     parsedUrl.Host,
+		Repo:    parsedUrl.Path,
+		Tag:     parsedUrl.Query().Get(constants.Tag),
+		PkgName: filepath.Base(parsedUrl.Path),
+	}
+}
+
+// NewOciOptionsFromRef will parse the oci options from the oci ref.
+// The ref should be in the format of 'repoName:repoTag'.
+func NewOciOptionsFromRef(refStr string, settings *settings.Settings) (*OciOptions, error) {
+	reg := settings.DefaultOciRegistry()
+	repo := settings.DefaultOciRepo()
+	tag := ""
+
+	ref, err := registry.ParseReference(refStr)
+	if err != nil {
+		var pkgName string
+		pkgName, tag, err = ParseOciPkgNameAndVersion(refStr)
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(pkgName, "/") {
+			repo = fmt.Sprintf("%s/%s", repo, pkgName)
+		} else {
+			repo = fmt.Sprintf("%s%s", repo, pkgName)
+		}
+	} else {
+		reg = ref.Registry
+		repo = ref.Repository
+		tag = ref.ReferenceOrDefault()
+	}
+
+	return &OciOptions{
+		Reg:     reg,
+		Repo:    repo,
+		Tag:     tag,
+		PkgName: filepath.Base(repo),
+	}, nil
+}
+
+// NewLocalOptionsFromUrl will parse the local options from the local path.
+// scheme 'file' and only path is supported.
+func NewLocalOptionsFromUrl(parsedUrl *url.URL) (*LocalOptions, error) {
+	return ParseLocalPathOptions(parsedUrl.Path)
+}
+
+// parseOciPkgNameAndVersion will parse package name and version
+// from string "<pkg_name>:<pkg_version>".
+func ParseOciPkgNameAndVersion(s string) (string, string, error) {
+	parts := strings.Split(s, ":")
+	if len(parts) == 1 {
+		return parts[0], "", nil
+	}
+
+	if len(parts) > 2 {
+		return "", "", reporter.NewErrorEvent(reporter.InvalidPkgRef, fmt.Errorf("invalid oci package reference '%s'", s))
+	}
+
+	if parts[1] == "" {
+		return "", "", reporter.NewErrorEvent(reporter.InvalidPkgRef, fmt.Errorf("invalid oci package reference '%s'", s))
+	}
+
+	return parts[0], parts[1], nil
+}
+
+// ParseLocalPathOptions will parse the local path information from user cli inputs.
+func ParseLocalPathOptions(localPath string) (*LocalOptions, *reporter.KpmEvent) {
+	if localPath == "" {
+		return nil, reporter.NewErrorEvent(reporter.PathIsEmpty, errors.PathIsEmpty)
+	}
+	// check if the local path exists.
+	if _, err := os.Stat(localPath); os.IsNotExist(err) {
+		return nil, reporter.NewErrorEvent(reporter.LocalPathNotExist, err)
+	} else {
+		return &LocalOptions{
+			Path: localPath,
+		}, nil
+	}
 }
 
 type GitOptions struct {
@@ -274,8 +463,14 @@ func ParseOciUrl(ociUrl string) (*OciOptions, *reporter.KpmEvent) {
 //	}
 //
 // You will get a path '/usr/test/docker.io/test/testRepo/v0.0.1'.
+// Deprecated: This function will be deprecated, use 'SanitizePathWithSuffix' instead.
 func (oci *OciOptions) AddStoragePathSuffix(pathPrefix string) string {
 	return filepath.Join(filepath.Join(filepath.Join(pathPrefix, oci.Reg), oci.Repo), oci.Tag)
+}
+
+// SanitizePathSuffix will take 'Registry/Repo/Tag' as a path suffix and sanitize it.
+func (oci *OciOptions) SanitizePathWithSuffix(pathPrefix string) string {
+	return path.SanitizePath(filepath.Join(filepath.Join(filepath.Join(pathPrefix, oci.Reg), oci.Repo), oci.Tag))
 }
 
 type OciManifestOptions struct {

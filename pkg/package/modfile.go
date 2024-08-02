@@ -2,14 +2,17 @@
 package pkg
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	orderedmap "github.com/elliotchance/orderedmap/v2"
+
 	"kcl-lang.io/kcl-go/pkg/kcl"
+
+	"kcl-lang.io/kpm/pkg/downloader"
 	"kcl-lang.io/kpm/pkg/opt"
 	"kcl-lang.io/kpm/pkg/reporter"
 	"kcl-lang.io/kpm/pkg/runner"
@@ -20,14 +23,25 @@ import (
 const (
 	MOD_FILE      = "kcl.mod"
 	MOD_LOCK_FILE = "kcl.mod.lock"
+	GIT           = "git"
+	OCI           = "oci"
+	LOCAL         = "local"
 )
 
 // 'Package' is the kcl package section of 'kcl.mod'.
 type Package struct {
-	Name        string `toml:"name,omitempty"`        // kcl package name
-	Edition     string `toml:"edition,omitempty"`     // kcl compiler version
-	Version     string `toml:"version,omitempty"`     // kcl package version
+	// The name of the package.
+	Name string `toml:"name,omitempty"`
+	// The kcl compiler version
+	Edition string `toml:"edition,omitempty"`
+	// The version of the package.
+	Version string `toml:"version,omitempty"`
+	// Description denotes the description of the package.
 	Description string `toml:"description,omitempty"` // kcl package description
+	// Exclude denote the files to include when publishing.
+	Include []string `toml:"include,omitempty"`
+	// Exclude denote the files to exclude when publishing.
+	Exclude []string `toml:"exclude,omitempty"`
 }
 
 // 'ModFile' is kcl package file 'kcl.mod'.
@@ -107,12 +121,16 @@ func (profile *Profile) GetEntries() []string {
 
 // FillDependenciesInfo will fill registry information for all dependencies in a kcl.mod.
 func (modFile *ModFile) FillDependenciesInfo() error {
-	for k, v := range modFile.Deps {
-		err := v.FillDepInfo()
+	for _, k := range modFile.Deps.Keys() {
+		v, ok := modFile.Deps.Get(k)
+		if !ok {
+			break
+		}
+		err := v.FillDepInfo(modFile.HomePath)
 		if err != nil {
 			return err
 		}
-		modFile.Deps[k] = v
+		modFile.Deps.Set(k, v)
 	}
 	return nil
 }
@@ -127,16 +145,24 @@ func (modFile *ModFile) GetEntries() []string {
 
 // 'Dependencies' is dependencies section of 'kcl.mod'.
 type Dependencies struct {
-	Deps map[string]Dependency `json:"packages" toml:"dependencies,omitempty"`
+	Deps *orderedmap.OrderedMap[string, Dependency] `json:"packages" toml:"dependencies,omitempty"`
 }
 
 // ToDepMetadata will transform the dependencies into metadata.
 // And check whether the dependency name conflicts.
-func (deps *Dependencies) ToDepMetadata() (*Dependencies, error) {
-	depMetadata := Dependencies{
+func (deps *Dependencies) ToDepMetadata() (*DependenciesUI, error) {
+	depMetadata := DependenciesUI{
 		Deps: make(map[string]Dependency),
 	}
-	for _, d := range deps.Deps {
+	for _, depName := range deps.Deps.Keys() {
+		d, ok := deps.Deps.Get(depName)
+		if !ok {
+			return nil, reporter.NewErrorEvent(
+				reporter.DependencyNotFoundInOrderedMap,
+				fmt.Errorf("dependency %s not found", depName),
+				"internal bugs, please contact us to fix it.",
+			)
+		}
 		if _, ok := depMetadata.Deps[d.GetAliasName()]; ok {
 			return nil, reporter.NewErrorEvent(
 				reporter.PathIsEmpty,
@@ -152,6 +178,16 @@ func (deps *Dependencies) ToDepMetadata() (*Dependencies, error) {
 	return &depMetadata, nil
 }
 
+func (deps *Dependencies) CheckForLocalDeps() bool {
+	for _, depKeys := range deps.Deps.Keys() {
+		dep, _ := deps.Deps.Get(depKeys)
+		if dep.IsFromLocal() {
+			return true
+		}
+	}
+	return false
+}
+
 type Dependency struct {
 	Name     string `json:"name" toml:"name,omitempty"`
 	FullName string `json:"-" toml:"full_name,omitempty"`
@@ -160,8 +196,14 @@ type Dependency struct {
 	// The actual local path of the package.
 	// In vendor mode is "current_kcl_package/vendor"
 	// In non-vendor mode is "$KCL_PKG_PATH"
-	LocalFullPath string `json:"manifest_path" toml:"-"`
-	Source        `json:"-"`
+	LocalFullPath     string `json:"manifest_path" toml:"-"`
+	downloader.Source `json:"-"`
+}
+
+func (d *Dependency) FromKclPkg(pkg *KclPkg) {
+	d.FullName = pkg.GetPkgFullName()
+	d.Version = pkg.GetPkgVersion()
+	d.LocalFullPath = pkg.HomePath
 }
 
 // SetName will set the name and alias name of a dependency.
@@ -169,11 +211,13 @@ func (d *Dependency) GetAliasName() string {
 	return strings.ReplaceAll(d.Name, "-", "_")
 }
 
-// WithTheSameVersion will check whether two dependencies have the same version.
-func (d Dependency) WithTheSameVersion(other Dependency) bool {
+func (d Dependency) Equals(other Dependency) bool {
+	var sameVersion = true
+	if len(d.Version) != 0 && len(other.Version) != 0 {
+		sameVersion = d.Version == other.Version
 
-	sameNameAndVersion := d.Name == other.Name && d.Version == other.Version
-
+	}
+	sameNameAndVersion := d.Name == other.Name && sameVersion
 	sameGitSrc := true
 	if d.Source.Git != nil && other.Source.Git != nil {
 		sameGitSrc = d.Source.Git.Url == other.Source.Git.Url &&
@@ -182,12 +226,19 @@ func (d Dependency) WithTheSameVersion(other Dependency) bool {
 				d.Source.Git.Tag == other.Source.Git.Tag)
 	}
 
-	return sameNameAndVersion && sameGitSrc
+	sameOciSrc := true
+	if d.Source.Oci != nil && other.Source.Oci != nil {
+		sameOciSrc = d.Source.Oci.Reg == other.Source.Oci.Reg &&
+			d.Source.Oci.Repo == other.Source.Oci.Repo &&
+			d.Source.Oci.Tag == other.Source.Oci.Tag
+	}
+
+	return sameNameAndVersion && sameGitSrc && sameOciSrc
 }
 
 // GetLocalFullPath will get the local path of a dependency.
 func (dep *Dependency) GetLocalFullPath(rootpath string) string {
-	if dep.IsFromLocal() {
+	if !filepath.IsAbs(dep.LocalFullPath) && dep.IsFromLocal() {
 		if filepath.IsAbs(dep.Source.Local.Path) {
 			return dep.Source.Local.Path
 		}
@@ -196,20 +247,51 @@ func (dep *Dependency) GetLocalFullPath(rootpath string) string {
 	return dep.LocalFullPath
 }
 
+func (d *Dependency) GenPathSuffix() string {
+
+	var storePkgName string
+
+	if d.Source.Oci != nil {
+		storePkgName = fmt.Sprintf(PKG_NAME_PATTERN, d.Name, d.Source.Oci.Tag)
+	} else if d.Source.Git != nil {
+		if len(d.Source.Git.Tag) != 0 {
+			storePkgName = fmt.Sprintf(PKG_NAME_PATTERN, d.Name, d.Source.Git.Tag)
+		} else if len(d.Source.Git.Commit) != 0 {
+			storePkgName = fmt.Sprintf(PKG_NAME_PATTERN, d.Name, d.Source.Git.Commit)
+		} else {
+			storePkgName = fmt.Sprintf(PKG_NAME_PATTERN, d.Name, d.Source.Git.Branch)
+		}
+	} else if d.Source.Registry != nil {
+		storePkgName = fmt.Sprintf(PKG_NAME_PATTERN, d.Name, d.Source.Registry.Version)
+	} else {
+		storePkgName = fmt.Sprintf(PKG_NAME_PATTERN, d.Name, d.Version)
+	}
+
+	return storePkgName
+}
+
 func (dep *Dependency) IsFromLocal() bool {
 	return dep.Source.Oci == nil && dep.Source.Git == nil && dep.Source.Local != nil
 }
 
 // FillDepInfo will fill registry information for a dependency.
-func (dep *Dependency) FillDepInfo() error {
+func (dep *Dependency) FillDepInfo(homepath string) error {
 	if dep.Source.Oci != nil {
 		settings := settings.GetSettings()
 		if settings.ErrorEvent != nil {
 			return settings.ErrorEvent
 		}
-		dep.Source.Oci.Reg = settings.DefaultOciRegistry()
-		urlpath := utils.JoinPath(settings.DefaultOciRepo(), dep.Name)
-		dep.Source.Oci.Repo = urlpath
+		if dep.Source.Oci.Reg == "" {
+			dep.Source.Oci.Reg = settings.DefaultOciRegistry()
+		}
+
+		if dep.Source.Oci.Repo == "" {
+			urlpath := utils.JoinPath(settings.DefaultOciRepo(), dep.Name)
+			dep.Source.Oci.Repo = urlpath
+		}
+	}
+	if dep.Source.Local != nil {
+		dep.LocalFullPath = dep.Source.Local.Path
 	}
 	return nil
 }
@@ -221,55 +303,57 @@ func (dep *Dependency) GenDepFullName() string {
 	return dep.FullName
 }
 
-// Source is the package source from registry.
-type Source struct {
-	*Git
-	*Oci
-	*Local
+// GetDownloadPath will get the download path of a dependency.
+func (dep *Dependency) GetDownloadPath() string {
+	if dep.Source.Git != nil {
+		return dep.Source.Git.Url
+	}
+	if dep.Source.Oci != nil {
+		return dep.Source.Oci.IntoOciUrl()
+	}
+	if dep.Source.Registry != nil {
+		return dep.Source.Registry.Oci.IntoOciUrl()
+	}
+	return ""
 }
 
-type Local struct {
-	Path string `toml:"path,omitempty"`
+func GenSource(sourceType string, uri string, tagName string) (downloader.Source, error) {
+	source := downloader.Source{}
+	if sourceType == GIT {
+		source.Git = &downloader.Git{
+			Url: uri,
+			Tag: tagName,
+		}
+		return source, nil
+	}
+	if sourceType == OCI {
+		oci := downloader.Oci{}
+		err := oci.FromString(uri + "?tag=" + tagName)
+		if err != nil {
+			return downloader.Source{}, err
+		}
+		source.Oci = &oci
+	}
+	if sourceType == LOCAL {
+		source.Local = &downloader.Local{
+			Path: uri,
+		}
+	}
+	return source, nil
 }
 
-type Oci struct {
-	Reg  string `toml:"reg,omitempty"`
-	Repo string `toml:"repo,omitempty"`
-	Tag  string `toml:"oci_tag,omitempty"`
-}
-
-// Git is the package source from git registry.
-type Git struct {
-	Url    string `toml:"url,omitempty"`
-	Branch string `toml:"branch,omitempty"`
-	Commit string `toml:"commit,omitempty"`
-	Tag    string `toml:"git_tag,omitempty"`
-}
-
-// GetValidGitReference will get the valid git reference from git source.
-// Only one of branch, tag or commit is allowed.
-func (git *Git) GetValidGitReference() (string, error) {
-	nonEmptyFields := 0
-	var nonEmptyRef string
-
-	if git.Tag != "" {
-		nonEmptyFields++
-		nonEmptyRef = git.Tag
+// GetSourceType will get the source type of a dependency.
+func (dep *Dependency) GetSourceType() string {
+	if dep.Source.Git != nil {
+		return GIT
 	}
-	if git.Commit != "" {
-		nonEmptyFields++
-		nonEmptyRef = git.Commit
+	if dep.Source.Oci != nil || dep.Source.Registry != nil {
+		return OCI
 	}
-	if git.Branch != "" {
-		nonEmptyFields++
-		nonEmptyRef = git.Branch
+	if dep.Source.Local != nil {
+		return LOCAL
 	}
-
-	if nonEmptyFields != 1 {
-		return "", errors.New("only one of branch, tag or commit is allowed")
-	}
-
-	return nonEmptyRef, nil
+	return ""
 }
 
 // ModFileExists returns whether a 'kcl.mod' file exists in the path.
@@ -285,7 +369,7 @@ func ModLockFileExists(path string) (bool, error) {
 // LoadLockDeps will load all dependencies from 'kcl.mod.lock'.
 func LoadLockDeps(homePath string) (*Dependencies, error) {
 	deps := new(Dependencies)
-	deps.Deps = make(map[string]Dependency)
+	deps.Deps = orderedmap.NewOrderedMap[string, Dependency]()
 	err := deps.loadLockFile(filepath.Join(homePath, MOD_LOCK_FILE))
 
 	if os.IsNotExist(err) {
@@ -331,7 +415,7 @@ func NewModFile(opts *opt.InitOptions) *ModFile {
 			Edition: defaultEdition,
 		},
 		Dependencies: Dependencies{
-			Deps: make(map[string]Dependency),
+			Deps: orderedmap.NewOrderedMap[string, Dependency](),
 		},
 	}
 }
@@ -364,7 +448,7 @@ func LoadModFile(homePath string) (*ModFile, error) {
 	modFile.HomePath = homePath
 
 	if modFile.Dependencies.Deps == nil {
-		modFile.Dependencies.Deps = make(map[string]Dependency)
+		modFile.Dependencies.Deps = orderedmap.NewOrderedMap[string, Dependency]()
 	}
 	err = modFile.FillDependenciesInfo()
 	if err != nil {
@@ -397,7 +481,7 @@ func (deps *Dependencies) loadLockFile(filepath string) error {
 // Parse out some information for a Dependency from registry url.
 func ParseOpt(opt *opt.RegistryOptions) (*Dependency, error) {
 	if opt.Git != nil {
-		gitSource := Git{
+		gitSource := downloader.Git{
 			Url:    opt.Git.Url,
 			Branch: opt.Git.Branch,
 			Commit: opt.Git.Commit,
@@ -417,24 +501,23 @@ func ParseOpt(opt *opt.RegistryOptions) (*Dependency, error) {
 		return &Dependency{
 			Name:     ParseRepoNameFromGitSource(gitSource),
 			FullName: fullName,
-			Source: Source{
+			Source: downloader.Source{
 				Git: &gitSource,
 			},
 			Version: gitRef,
 		}, nil
 	}
 	if opt.Oci != nil {
-		repoPath := utils.JoinPath(opt.Oci.Repo, opt.Oci.PkgName)
-		ociSource := Oci{
+		ociSource := downloader.Oci{
 			Reg:  opt.Oci.Reg,
-			Repo: repoPath,
+			Repo: opt.Oci.Repo,
 			Tag:  opt.Oci.Tag,
 		}
 
 		return &Dependency{
 			Name:     opt.Oci.PkgName,
 			FullName: opt.Oci.PkgName + "_" + opt.Oci.Tag,
-			Source: Source{
+			Source: downloader.Source{
 				Oci: &ociSource,
 			},
 			Version: opt.Oci.Tag,
@@ -450,14 +533,32 @@ func ParseOpt(opt *opt.RegistryOptions) (*Dependency, error) {
 			Name:          depPkg.ModFile.Pkg.Name,
 			FullName:      depPkg.ModFile.Pkg.Name + "_" + depPkg.ModFile.Pkg.Version,
 			LocalFullPath: opt.Local.Path,
-			Source: Source{
-				Local: &Local{
+			Source: downloader.Source{
+				Local: &downloader.Local{
 					Path: opt.Local.Path,
 				},
 			},
 			Version: depPkg.ModFile.Pkg.Version,
 		}, nil
+	}
+	if opt.Registry != nil {
+		ociSource := downloader.Oci{
+			Reg:  opt.Registry.Reg,
+			Repo: opt.Registry.Repo,
+			Tag:  opt.Registry.Tag,
+		}
 
+		return &Dependency{
+			Name:     opt.Registry.PkgName,
+			FullName: opt.Registry.PkgName + "_" + opt.Registry.Tag,
+			Source: downloader.Source{
+				Registry: &downloader.Registry{
+					Oci:     &ociSource,
+					Version: opt.Registry.Tag,
+				},
+			},
+			Version: opt.Registry.Tag,
+		}, nil
 	}
 	return nil, nil
 }
@@ -465,7 +566,7 @@ func ParseOpt(opt *opt.RegistryOptions) (*Dependency, error) {
 const PKG_NAME_PATTERN = "%s_%s"
 
 // ParseRepoFullNameFromGitSource will extract the kcl package name from the git url.
-func ParseRepoFullNameFromGitSource(gitSrc Git) (string, error) {
+func ParseRepoFullNameFromGitSource(gitSrc downloader.Git) (string, error) {
 	ref, err := gitSrc.GetValidGitReference()
 	if err != nil {
 		return "", err
@@ -477,6 +578,6 @@ func ParseRepoFullNameFromGitSource(gitSrc Git) (string, error) {
 }
 
 // ParseRepoNameFromGitSource will extract the kcl package name from the git url.
-func ParseRepoNameFromGitSource(gitSrc Git) string {
+func ParseRepoNameFromGitSource(gitSrc downloader.Git) string {
 	return utils.ParseRepoNameFromGitUrl(gitSrc.Url)
 }

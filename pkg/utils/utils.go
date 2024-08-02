@@ -3,8 +3,10 @@ package utils
 import (
 	"archive/tar"
 	"bufio"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/base64"
+	goerrors "errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,12 +14,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
-	goerrors "errors"
-
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
 	"github.com/moby/term"
+	"github.com/otiai10/copy"
+
+	"kcl-lang.io/kcl-go/pkg/utils"
 	"kcl-lang.io/kpm/pkg/constants"
 	"kcl-lang.io/kpm/pkg/errors"
 	"kcl-lang.io/kpm/pkg/reporter"
@@ -125,8 +129,7 @@ func Exists(path string) (bool, error) {
 // todo: Consider using the OCI tarball as the standard tar format.
 var ignores = []string{".git", ".tar"}
 
-func TarDir(srcDir string, tarPath string) error {
-
+func TarDir(srcDir string, tarPath string, include []string, exclude []string) error {
 	fw, err := os.Create(tarPath)
 	if err != nil {
 		log.Fatal(err)
@@ -143,6 +146,26 @@ func TarDir(srcDir string, tarPath string) error {
 
 		for _, ignore := range ignores {
 			if strings.Contains(path, ignore) {
+				return nil
+			}
+		}
+
+		getNewPattern := func(ex string) string {
+			newPath := ex
+			if !strings.HasPrefix(ex, srcDir+string(filepath.Separator)) {
+				newPath = filepath.Join(srcDir, ex)
+			}
+			return newPath
+		}
+
+		for _, ex := range exclude {
+			if matched, _ := filepath.Match(getNewPattern(ex), path); matched {
+				return nil
+			}
+		}
+
+		for _, inc := range include {
+			if matched, _ := filepath.Match(getNewPattern(inc), path); !matched {
 				return nil
 			}
 		}
@@ -226,10 +249,146 @@ func UnTarDir(tarPath string, destDir string) error {
 	return nil
 }
 
+// ExtractTarball support extracting tarball with '.tgz' format.
+func ExtractTarball(tarPath, destDir string) error {
+	f, err := os.Open(tarPath)
+	if err != nil {
+		return reporter.NewErrorEvent(reporter.FailedCreateFile, err, fmt.Sprintf("failed to open '%s'", tarPath))
+	}
+	defer f.Close()
+
+	zip, err := gzip.NewReader(f)
+	if err != nil {
+		return reporter.NewErrorEvent(reporter.FailedCreateFile, err, fmt.Sprintf("failed to open '%s'", tarPath))
+	}
+	tarReader := tar.NewReader(zip)
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return reporter.NewErrorEvent(reporter.FailedCreateFile, err, fmt.Sprintf("failed to open '%s'", tarPath))
+		}
+
+		destFilePath := filepath.Join(destDir, header.Name)
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(destFilePath, 0755); err != nil {
+				return errors.FailedUnTarKclPackage
+			}
+		case tar.TypeReg:
+			err := os.MkdirAll(filepath.Dir(destFilePath), 0755)
+			if err != nil {
+				return err
+			}
+			outFile, err := os.Create(destFilePath)
+			if err != nil {
+				return reporter.NewErrorEvent(reporter.FailedCreateFile, err, fmt.Sprintf("failed to open '%s'", tarPath))
+			}
+			defer outFile.Close()
+
+			if _, err := io.Copy(outFile, tarReader); err != nil {
+				return reporter.NewErrorEvent(reporter.FailedCreateFile, err, fmt.Sprintf("failed to open '%s'", tarPath))
+			}
+		default:
+			return errors.UnknownTarFormat
+		}
+	}
+
+	return nil
+}
+
 // DirExists will check whether the directory 'path' exists.
 func DirExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+const ModRelativePathPattern = `\$\{([a-zA-Z0-9_-]+:)?KCL_MOD\}/`
+
+// If the path preffix is `${KCL_MOD}` or `${KCL_MOD:xxx}`
+func IsModRelativePath(s string) bool {
+	re := regexp.MustCompile(ModRelativePathPattern)
+	return re.MatchString(s)
+}
+
+// MoveFile will move the file from 'src' to 'dest'.
+// On windows, it will copy the file from 'src' to 'dest', and then delete the file under 'src'.
+// On unix-like systems, it will rename the file from 'src' to 'dest'.
+func MoveFile(src, dest string) error {
+	if utils.DirExists(dest) {
+		err := os.RemoveAll(dest)
+		if err != nil {
+			return err
+		}
+	}
+
+	destDir := filepath.Dir(dest)
+	if !utils.DirExists(destDir) {
+		err := os.MkdirAll(destDir, os.ModePerm)
+		if err != nil {
+			return err
+		}
+	}
+
+	var err error
+	if runtime.GOOS != "windows" {
+		err = os.Rename(src, dest)
+		if err != nil {
+			return err
+		}
+	} else {
+		err = copy.Copy(src, dest)
+		if err != nil {
+			return err
+		}
+		err = os.RemoveAll(src)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// IsSymlinkValidAndExists will check whether the symlink exists and points to a valid target
+// return three values: whether the symlink exists, whether it points to a valid target, and any error encountered
+// Note: IsSymlinkValidAndExists is only useful on unix-like systems.
+func IsSymlinkValidAndExists(symlinkPath string) (bool, bool, error) {
+	// check if the symlink exists
+	info, err := os.Lstat(symlinkPath)
+	if err != nil && os.IsNotExist(err) {
+		// symlink does not exist
+		return false, false, nil
+	} else if err != nil {
+		// other error
+		return false, false, err
+	}
+
+	// check if the file is a symlink
+	if info.Mode()&os.ModeSymlink == os.ModeSymlink {
+		// get the target of the symlink
+		target, err := os.Readlink(symlinkPath)
+		if err != nil {
+			// can not read the target
+			return true, false, err
+		}
+
+		// check if the target exists
+		_, err = os.Stat(target)
+		if err == nil {
+			// target exists
+			return true, true, nil
+		}
+		if os.IsNotExist(err) {
+			// target does not exist
+			return true, false, nil
+		}
+		return true, false, err
+	}
+
+	return false, false, fmt.Errorf("%s exists but is not a symlink", symlinkPath)
 }
 
 // DefaultKpmHome create the '.kpm' in the user home and return the path of ".kpm".
@@ -252,15 +411,22 @@ func CreateSubdirInUserHome(subdir string) (string, error) {
 
 // CreateSymlink will create symbolic link named 'newName' for 'oldName',
 // and if the symbolic link already exists, it will be deleted and recreated.
+// Note: CreateSymlink is only useful on unix-like systems.
 func CreateSymlink(oldName, newName string) error {
-	if DirExists(newName) {
+	symExist, _, err := IsSymlinkValidAndExists(newName)
+
+	if err != nil {
+		return err
+	}
+
+	if symExist {
 		err := os.Remove(newName)
 		if err != nil {
 			return err
 		}
 	}
 
-	err := os.Symlink(oldName, newName)
+	err = os.Symlink(oldName, newName)
 	if err != nil {
 		return err
 	}

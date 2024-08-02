@@ -2,25 +2,33 @@ package oci
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
 
+	"github.com/containers/image/v5/docker"
+	"github.com/containers/image/v5/types"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/thoas/go-funk"
-	"kcl-lang.io/kpm/pkg/constants"
-	"kcl-lang.io/kpm/pkg/opt"
-	pkg "kcl-lang.io/kpm/pkg/package"
-	"kcl-lang.io/kpm/pkg/reporter"
-	"kcl-lang.io/kpm/pkg/semver"
-	"kcl-lang.io/kpm/pkg/settings"
-	"kcl-lang.io/kpm/pkg/utils"
 	"oras.land/oras-go/pkg/auth"
 	dockerauth "oras.land/oras-go/pkg/auth/docker"
 	remoteauth "oras.land/oras-go/v2/registry/remote/auth"
 
+	"kcl-lang.io/kpm/pkg/opt"
+	"kcl-lang.io/kpm/pkg/reporter"
+	"kcl-lang.io/kpm/pkg/semver"
+	"kcl-lang.io/kpm/pkg/settings"
+	"kcl-lang.io/kpm/pkg/utils"
+
 	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content"
 	"oras.land/oras-go/v2/content/file"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/errcode"
@@ -86,9 +94,57 @@ func Logout(hostname string, setting *settings.Settings) error {
 
 // OciClient is mainly responsible for interacting with OCI registry
 type OciClient struct {
-	repo      *remote.Repository
-	ctx       *context.Context
-	logWriter io.Writer
+	repo           *remote.Repository
+	ctx            *context.Context
+	logWriter      io.Writer
+	settings       *settings.Settings
+	isPlainHttp    *bool
+	cred           *remoteauth.Credential
+	PullOciOptions *PullOciOptions
+}
+
+// OciClientOption configures how we set up the OciClient
+type OciClientOption func(*OciClient) error
+
+// WithSettings sets the kpm settings of the OciClient
+func WithSettings(settings *settings.Settings) OciClientOption {
+	return func(c *OciClient) error {
+		c.settings = settings
+		return nil
+	}
+}
+
+// WithRepoPath sets the repo path of the OciClient
+func WithRepoPath(repoPath string) OciClientOption {
+	return func(c *OciClient) error {
+		var err error
+		c.repo, err = remote.NewRepository(repoPath)
+		if err != nil {
+			return fmt.Errorf("repository '%s' not found", repoPath)
+		}
+		return nil
+	}
+}
+
+// WithCredential sets the credential of the OciClient
+func WithCredential(credential *remoteauth.Credential) OciClientOption {
+	return func(c *OciClient) error {
+		c.cred = credential
+		return nil
+	}
+}
+
+// WithPlainHttp sets the plain http of the OciClient
+func WithPlainHttp(plainHttp bool) OciClientOption {
+	return func(c *OciClient) error {
+		c.isPlainHttp = &plainHttp
+		return nil
+	}
+}
+
+type PullOciOptions struct {
+	Platform string
+	CopyOpts *oras.CopyOptions
 }
 
 func (ociClient *OciClient) SetLogWriter(writer io.Writer) {
@@ -99,23 +155,60 @@ func (ociClient *OciClient) GetReference() string {
 	return ociClient.repo.Reference.String()
 }
 
+// NewOciClientWithOpts will new an OciClient with options.
+func NewOciClientWithOpts(opts ...OciClientOption) (*OciClient, error) {
+	client := &OciClient{}
+	for _, opt := range opts {
+		err := opt(client)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	ctx := context.Background()
+	client.repo.Client = &remoteauth.Client{
+		Client:     retry.DefaultClient,
+		Cache:      remoteauth.DefaultCache,
+		Credential: remoteauth.StaticCredential(client.repo.Reference.Host(), *client.cred),
+	}
+
+	// If the plain http is not specified
+	if client.isPlainHttp == nil {
+		// Set the default value of the plain http
+		registry := client.repo.Reference.String()
+		host, _, _ := net.SplitHostPort(registry)
+		if host == "localhost" || registry == "localhost" {
+			// not specified, defaults to plain http for localhost
+			client.repo.PlainHTTP = true
+		}
+
+		// If the plain http is specified in the settings file
+		// Override the default value of the plain http
+		if client.settings != nil {
+			isPlainHttp, force := client.settings.ForceOciPlainHttp()
+			if force {
+				client.repo.PlainHTTP = isPlainHttp
+			}
+		}
+	}
+
+	client.ctx = &ctx
+	client.PullOciOptions = &PullOciOptions{
+		CopyOpts: &oras.CopyOptions{
+			CopyGraphOptions: oras.CopyGraphOptions{
+				MaxMetadataBytes: DEFAULT_LIMIT_STORE_SIZE, // default is 64 MiB
+			},
+		},
+	}
+
+	return client, nil
+}
+
 // NewOciClient will new an OciClient.
 // regName is the registry. e.g. ghcr.io or docker.io.
 // repoName is the repo name on registry.
+// Deprecated: use NewOciClientWithOpts instead.
 func NewOciClient(regName, repoName string, settings *settings.Settings) (*OciClient, error) {
-	repoPath := utils.JoinPath(regName, repoName)
-	repo, err := remote.NewRepository(repoPath)
-
-	if err != nil {
-		return nil, reporter.NewErrorEvent(
-			reporter.RepoNotFound,
-			err,
-			fmt.Sprintf("repository '%s' not found", repoPath),
-		)
-	}
-	ctx := context.Background()
-	repo.PlainHTTP = settings.DefaultOciPlainHttp()
-
 	// Login
 	credential, err := loadCredential(regName, settings)
 	if err != nil {
@@ -125,29 +218,28 @@ func NewOciClient(regName, repoName string, settings *settings.Settings) (*OciCl
 			fmt.Sprintf("failed to load credential for '%s' from '%s'.", regName, settings.CredentialsFile),
 		)
 	}
-	repo.Client = &remoteauth.Client{
-		Client:     retry.DefaultClient,
-		Cache:      remoteauth.DefaultCache,
-		Credential: remoteauth.StaticCredential(repo.Reference.Host(), *credential),
-	}
 
-	return &OciClient{
-		repo: repo,
-		ctx:  &ctx,
-	}, nil
+	return NewOciClientWithOpts(
+		WithRepoPath(utils.JoinPath(regName, repoName)),
+		WithCredential(credential),
+		WithSettings(settings),
+	)
 }
+
+// The default limit of the store size is 64 MiB.
+const DEFAULT_LIMIT_STORE_SIZE = 64 * 1024 * 1024
 
 // Pull will pull the oci artifacts from oci registry to local path.
 func (ociClient *OciClient) Pull(localPath, tag string) error {
 	// Create a file store
-	fs, err := file.New(localPath)
+	fs, err := file.NewWithFallbackLimit(localPath, DEFAULT_LIMIT_STORE_SIZE)
 	if err != nil {
 		return reporter.NewErrorEvent(reporter.FailedCreateStorePath, err, "Failed to create store path ", localPath)
 	}
 	defer fs.Close()
-
-	// Copy from the remote repository to the file store
-	_, err = oras.Copy(*ociClient.ctx, ociClient.repo, tag, fs, tag, oras.DefaultCopyOptions)
+	copyOpts := ociClient.PullOciOptions.CopyOpts
+	copyOpts.FindSuccessors = ociClient.PullOciOptions.Successors
+	_, err = oras.Copy(*ociClient.ctx, ociClient.repo, tag, fs, tag, *copyOpts)
 	if err != nil {
 		return reporter.NewErrorEvent(
 			reporter.FailedGetPkg,
@@ -281,7 +373,7 @@ func (ociClient *OciClient) PushWithOciManifest(localPath, tag string, opts *opt
 	return nil
 }
 
-// FetchManifestByRef will fetch the manifest and return it into json string.
+// FetchManifestIntoJsonStr will fetch the manifest and return it into json string.
 func (ociClient *OciClient) FetchManifestIntoJsonStr(opts opt.OciFetchOptions) (string, error) {
 	fetchOpts := opts.FetchBytesOptions
 	_, manifestContent, err := oras.FetchBytes(*ociClient.ctx, ociClient.repo, opts.Tag, fetchOpts)
@@ -363,16 +455,107 @@ func Push(localPath, hostName, repoName, tag string, settings *settings.Settings
 	return ociClient.Push(localPath, tag)
 }
 
-// GenOciManifestFromPkg will generate the oci manifest from the kcl package.
-func GenOciManifestFromPkg(kclPkg *pkg.KclPkg) (map[string]string, error) {
-	res := make(map[string]string)
-	res[constants.DEFAULT_KCL_OCI_MANIFEST_NAME] = kclPkg.GetPkgName()
-	res[constants.DEFAULT_KCL_OCI_MANIFEST_VERSION] = kclPkg.GetPkgVersion()
-	res[constants.DEFAULT_KCL_OCI_MANIFEST_DESCRIPTION] = kclPkg.GetPkgDescription()
-	sum, err := kclPkg.GenCheckSum()
+func GetAllImageTags(imageName string) ([]string, error) {
+	sysCtx := &types.SystemContext{}
+	ref, err := docker.ParseReference("//" + strings.TrimPrefix(imageName, "oci://"))
 	if err != nil {
-		return nil, err
+		log.Fatalf("Error parsing reference: %v", err)
 	}
-	res[constants.DEFAULT_KCL_OCI_MANIFEST_SUM] = sum
-	return res, nil
+
+	tags, err := docker.GetRepositoryTags(context.Background(), sysCtx, ref)
+	if err != nil {
+		log.Fatalf("Error getting tags: %v", err)
+	}
+	return tags, nil
+}
+
+const (
+	MediaTypeConfig           = "application/vnd.docker.container.image.v1+json"
+	MediaTypeManifestList     = "application/vnd.docker.distribution.manifest.list.v2+json"
+	MediaTypeManifest         = "application/vnd.docker.distribution.manifest.v2+json"
+	MediaTypeForeignLayer     = "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip"
+	MediaTypeArtifactManifest = "application/vnd.oci.artifact.manifest.v1+json"
+)
+
+// Successors returns the nodes directly pointed by the current node.
+// In other words, returns the "children" of the current descriptor.
+func (popts *PullOciOptions) Successors(ctx context.Context, fetcher content.Fetcher, node v1.Descriptor) ([]v1.Descriptor, error) {
+	switch node.MediaType {
+	case v1.MediaTypeImageManifest:
+		content, err := content.FetchAll(ctx, fetcher, node)
+		if err != nil {
+			return nil, err
+		}
+		var manifest v1.Manifest
+		if err := json.Unmarshal(content, &manifest); err != nil {
+			return nil, err
+		}
+		var nodes []v1.Descriptor
+		if manifest.Subject != nil {
+			nodes = append(nodes, *manifest.Subject)
+		}
+		nodes = append(nodes, manifest.Config)
+		return append(nodes, manifest.Layers...), nil
+	case v1.MediaTypeImageIndex:
+		content, err := content.FetchAll(ctx, fetcher, node)
+		if err != nil {
+			return nil, err
+		}
+
+		var index v1.Index
+		if err := json.Unmarshal(content, &index); err != nil {
+			return nil, err
+		}
+		var nodes []v1.Descriptor
+		if index.Subject != nil {
+			nodes = append(nodes, *index.Subject)
+		}
+
+		for _, manifest := range index.Manifests {
+			if manifest.Platform != nil && len(popts.Platform) != 0 {
+				pullPlatform, err := ParsePlatform(popts.Platform)
+				if err != nil {
+					return nil, err
+				}
+				if !reflect.DeepEqual(manifest.Platform, pullPlatform) {
+					continue
+				} else {
+					nodes = append(nodes, manifest)
+				}
+			} else {
+				nodes = append(nodes, manifest)
+			}
+		}
+		return nodes, nil
+	}
+	return nil, nil
+}
+
+func ParsePlatform(platform string) (*v1.Platform, error) {
+	// OS[/Arch[/Variant]][:OSVersion]
+	// If Arch is not provided, will use GOARCH instead
+	var platformStr string
+	var p v1.Platform
+	platformStr, p.OSVersion, _ = strings.Cut(platform, ":")
+	parts := strings.Split(platformStr, "/")
+	switch len(parts) {
+	case 3:
+		p.Variant = parts[2]
+		fallthrough
+	case 2:
+		p.Architecture = parts[1]
+	case 1:
+		p.Architecture = runtime.GOARCH
+	default:
+		return nil, fmt.Errorf("failed to parse platform %q: expected format os[/arch[/variant]]", platform)
+	}
+	p.OS = parts[0]
+	if p.OS == "" {
+		return nil, fmt.Errorf("invalid platform: OS cannot be empty")
+	}
+	if p.Architecture == "" {
+		return nil, fmt.Errorf("invalid platform: Architecture cannot be empty")
+	}
+
+	return &p, nil
 }

@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"kcl-lang.io/kpm/pkg/client"
 	"kcl-lang.io/kpm/pkg/constants"
 	"kcl-lang.io/kpm/pkg/opt"
+	"kcl-lang.io/kpm/pkg/utils"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
@@ -97,13 +99,13 @@ var _ = ginkgo.Describe("Kpm CLI Testing", func() {
 		testSuitesRoot := filepath.Join(filepath.Join(filepath.Join(GetWorkDir(), TEST_SUITES_DIR), "kpm"), "workflows")
 
 		files, _ := os.ReadDir(testSuitesRoot)
-		for _, file := range files {
+		for _, f := range files {
+			file := f
 			ginkgo.It(filepath.Join(testSuitesRoot, file.Name()), func() {
 				if file.IsDir() {
 					testSuites := LoadAllTestSuites(filepath.Join(testSuitesRoot, file.Name()))
 					for _, ts := range testSuites {
 						ts := ts
-
 						workspace := GetWorkspace()
 
 						stdout, stderr, err := ExecKpmWithWorkDir(ts.Input, workspace)
@@ -133,10 +135,15 @@ var _ = ginkgo.Describe("Kpm CLI Testing", func() {
 			ginkgo.It(ts.GetTestSuiteInfo(), func() {
 				workspace := GetWorkspace()
 
-				CopyDir(filepath.Join(testDataRoot, ts.Name), filepath.Join(workspace, ts.Name))
+				testSuitePath := filepath.Join(testDataRoot, ts.Name)
+				testWorkspace := workspace
+				if exist, _ := utils.Exists(testSuitePath); exist {
+					CopyDir(testSuitePath, filepath.Join(workspace, ts.Name))
+					testWorkspace = filepath.Join(workspace, ts.Name)
+				}
 
-				input := ReplaceAllKeyByValue(ts.Input, "<workspace>", filepath.Join(workspace, ts.Name))
-				stdout, stderr, err := ExecKpmWithWorkDir(input, filepath.Join(workspace, ts.Name))
+				input := ReplaceAllKeyByValue(ts.Input, "<workspace>", testWorkspace)
+				stdout, stderr, err := ExecKpmWithWorkDir(input, testWorkspace)
 
 				expectedStdout := ReplaceAllKeyByValue(ts.ExpectStdout, "<workspace>", workspace)
 				expectedStderr := ReplaceAllKeyByValue(ts.ExpectStderr, "<workspace>", workspace)
@@ -307,6 +314,53 @@ var _ = ginkgo.Describe("Kpm CLI Testing", func() {
 				gomega.Expect(manifest_expect.Annotations[constants.DEFAULT_KCL_OCI_MANIFEST_VERSION]).To(gomega.Equal("0.0.1"))
 				gomega.Expect(manifest_expect.Annotations[constants.DEFAULT_KCL_OCI_MANIFEST_DESCRIPTION]).To(gomega.Equal("This is the kcl package named kcl2"))
 				gomega.Expect(manifest_expect.Annotations[constants.DEFAULT_KCL_OCI_MANIFEST_SUM]).To(gomega.Equal("Y/QXruiaxcJcmOnKWl4UEFuUqKTtbi4jTTeuEjeGV8s="))
+			})
+		}
+	})
+
+	ginkgo.Context("testing 'test push '", func() {
+		testSuitesRoot := filepath.Join(filepath.Join(filepath.Join(GetWorkDir(), TEST_SUITES_DIR), "kpm"), "kpm_push")
+		testSuites := LoadAllTestSuites(testSuitesRoot)
+		testDataRoot := filepath.Join(filepath.Join(GetWorkDir(), TEST_SUITES_DIR), "test_data")
+		for _, ts := range testSuites {
+			ts := ts
+			ginkgo.It(ts.GetTestSuiteInfo(), func() {
+				workspace := GetWorkspace()
+
+				CopyDir(filepath.Join(testDataRoot, ts.Name), filepath.Join(workspace, ts.Name))
+
+				kpmcli, err := client.NewKpmClient()
+				gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+				fmt.Printf("ts.Name: %v\n", ts.Name)
+				kpkg, err := kpmcli.LoadPkgFromPath(filepath.Join(workspace, ts.Name))
+				gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+				kpkg.ModFile.Pkg.Version = "0.0.100"
+				kpkg.ModFile.Pkg.Name = "helloworld"
+
+				kpkg.HomePath = filepath.Join(workspace, ts.Name, "helloworld")
+				kpkg.ModFile.HomePath = kpkg.HomePath
+				err = os.MkdirAll(kpkg.HomePath, os.ModePerm)
+				fmt.Printf("kpkg.HomePath: %v\n", kpkg.HomePath)
+				gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+				err = kpmcli.InitEmptyPkg(kpkg)
+				gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+				// Init a package with tag create by time
+				input := ReplaceAllKeyByValue(ts.Input, "<workspace>", filepath.Join(workspace, ts.Name))
+				stdout, stderr, err := ExecKpmWithWorkDir(input, kpkg.HomePath)
+				expectedStdout := ReplaceAllKeyByValue(ts.ExpectStdout, "<workspace>", workspace)
+				expectedStderr := ReplaceAllKeyByValue(ts.ExpectStderr, "<workspace>", workspace)
+
+				gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+				if !IsIgnore(expectedStdout) {
+					gomega.Expect(stdout).To(gomega.ContainSubstring(expectedStdout))
+				}
+				if !IsIgnore(expectedStderr) {
+					gomega.Expect(stderr).To(gomega.ContainSubstring(expectedStderr))
+				}
+
+				gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
 			})
 		}
 	})

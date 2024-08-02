@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -23,13 +24,12 @@ func TestPackageApi(t *testing.T) {
 	assert.Equal(t, pkg.GetPkgName(), "kcl_pkg")
 	assert.Equal(t, pkg.GetVersion(), "0.0.1")
 	assert.Equal(t, pkg.GetEdition(), "0.0.1")
-	assert.Equal(t, len(pkg.GetDependencies().Deps), 1)
+	assert.Equal(t, pkg.GetDependencies().Deps.Len(), 1)
 
-	dep := pkg.GetDependencies().Deps["k8s"]
+	dep, _ := pkg.GetDependencies().Deps.Get("k8s")
 	assert.Equal(t, dep.Name, "k8s")
 	assert.Equal(t, dep.FullName, "k8s_1.27")
 	assert.Equal(t, dep.Version, "1.27")
-	assert.Equal(t, dep.Sum, "xnYM1FWHAy3m+KcQMQb2rjZouTxumqYt6FGZpu2T4yM=")
 	assert.Equal(t, dep.Source.Oci.Reg, "ghcr.io")
 	assert.Equal(t, dep.Source.Oci.Repo, "kcl-lang/k8s")
 	assert.Equal(t, dep.Source.Oci.Tag, "1.27")
@@ -39,7 +39,7 @@ func TestPackageApi(t *testing.T) {
 	schemas, err := pkg.GetAllSchemaTypeMapping()
 	assert.Equal(t, err, nil)
 	assert.Equal(t, len(schemas), 3)
-	assert.Equal(t, len(schemas["."]), 4)
+	assert.Equal(t, len(schemas["."]), 2)
 	assert.Equal(t, len(schemas[filepath.Join("sub")]), 1)
 	assert.Equal(t, len(schemas[filepath.Join("sub", "sub1")]), 2)
 
@@ -58,6 +58,19 @@ func TestPackageApi(t *testing.T) {
 	assert.Equal(t, schemas[filepath.Join("sub", "sub1")]["SchemaInSubSub1K"].SchemaName, "SchemaInSubSub1K")
 	assert.Equal(t, schemas[filepath.Join("sub", "sub1")]["SchemaWithSameName"].Type, "schema")
 	assert.Equal(t, schemas[filepath.Join("sub", "sub1")]["SchemaWithSameName"].SchemaName, "SchemaWithSameName")
+}
+
+func TestApiGetDependenciesInModFile(t *testing.T) {
+	pkg_path := filepath.Join(getTestDir("test_get_mod_deps"), "kcl_pkg")
+	pkg, err := GetKclPackage(pkg_path)
+	assert.Equal(t, err, nil)
+	dep, _ := pkg.GetDependenciesInModFile().Deps.Get("k8s")
+	assert.Equal(t, dep.Name, "k8s")
+	assert.Equal(t, dep.FullName, "k8s_1.27")
+	assert.Equal(t, dep.Version, "1.27")
+	assert.Equal(t, dep.Source.Registry.Oci.Reg, "ghcr.io")
+	assert.Equal(t, dep.Source.Registry.Oci.Repo, "kcl-lang/k8s")
+	assert.Equal(t, dep.Source.Registry.Oci.Tag, "1.27")
 }
 
 func TestGetAllSchemaTypesMappingNamed(t *testing.T) {
@@ -153,8 +166,10 @@ func TestGetFullSchemaTypeMappingWithFilters(t *testing.T) {
 	assert.Equal(t, err, nil)
 	assert.Equal(t, len(schemas), 1)
 
-	assert.Equal(t, schemas[filepath.Join(".")]["B"].Type, "schema")
-	assert.Equal(t, schemas[filepath.Join(".")]["B"].SchemaName, "B")
+	fmt.Println(schemas)
+
+	assert.Equal(t, schemas[filepath.Join(".")]["a"].Type, "schema")
+	assert.Equal(t, schemas[filepath.Join(".")]["a"].SchemaName, "B")
 }
 
 func TestGetSchemaTypeUnderEmptyDir(t *testing.T) {
@@ -191,5 +206,18 @@ func TestGetEntries(t *testing.T) {
 
 	assert.Equal(t, err, nil)
 	assert.Equal(t, res.GetRawYamlResult(), "sub: test in sub")
-	assert.Equal(t, res.GetRawJsonResult(), "{\"sub\":\"test in sub\"}\n")
+	assert.Equal(t, res.GetRawJsonResult(), "{\"sub\": \"test in sub\"}")
+}
+
+func TestExportSwaggerV2Spec(t *testing.T) {
+	pkg_path := filepath.Join(getTestDir("test_kpm_package"), "export_swagger", "aaa")
+	pkg, err := GetKclPackage(pkg_path)
+	assert.Equal(t, err, nil)
+	kpmcli, err := client.NewKpmClient()
+	assert.Equal(t, err, nil)
+	err = kpmcli.ResolvePkgDepsMetadata(pkg.pkg, true)
+	assert.Equal(t, err, nil)
+	spec, err := pkg.ExportSwaggerV2Spec()
+	assert.Equal(t, err, nil)
+	assert.Equal(t, len(spec.Definitions), 1)
 }

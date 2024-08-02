@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
 	"kcl-lang.io/kpm/pkg/opt"
 	"kcl-lang.io/kpm/pkg/runner"
 	"kcl-lang.io/kpm/pkg/utils"
@@ -21,11 +22,11 @@ func TestModFileWithDesc(t *testing.T) {
 	assert.Equal(t, modFile.Pkg.Version, "0.0.1")
 	assert.Equal(t, modFile.Pkg.Edition, "0.0.1")
 	assert.Equal(t, modFile.Pkg.Description, "This is a test module with a description")
-	assert.Equal(t, len(modFile.Dependencies.Deps), 0)
+	assert.Equal(t, modFile.Dependencies.Deps.Len(), 0)
 	assert.Equal(t, err, nil)
 }
 
-func TestWithTheSameVersion(t *testing.T) {
+func TestDepEquals(t *testing.T) {
 	d := Dependency{
 		Name:    "test",
 		Version: "0.0.1",
@@ -36,13 +37,13 @@ func TestWithTheSameVersion(t *testing.T) {
 		Version: "0.0.2",
 	}
 
-	assert.Equal(t, d.WithTheSameVersion(d2), false)
+	assert.Equal(t, d.Equals(d2), false)
 
 	d2.Version = "0.0.1"
-	assert.Equal(t, d.WithTheSameVersion(d2), true)
+	assert.Equal(t, d.Equals(d2), true)
 
 	d2.Name = "test2"
-	assert.Equal(t, d.WithTheSameVersion(d2), false)
+	assert.Equal(t, d.Equals(d2), false)
 }
 
 func TestModFileExists(t *testing.T) {
@@ -169,15 +170,20 @@ func TestLoadModFile(t *testing.T) {
 	assert.Equal(t, modFile.Pkg.Version, "0.0.1")
 	assert.Equal(t, modFile.Pkg.Edition, "0.0.1")
 
-	assert.Equal(t, len(modFile.Dependencies.Deps), 2)
-	assert.Equal(t, modFile.Dependencies.Deps["name"].Name, "name")
-	assert.Equal(t, modFile.Dependencies.Deps["name"].Source.Git.Url, "test_url")
-	assert.Equal(t, modFile.Dependencies.Deps["name"].Source.Git.Tag, "test_tag")
-	assert.Equal(t, modFile.Dependencies.Deps["name"].FullName, "name_test_tag")
+	assert.Equal(t, modFile.Dependencies.Deps.Len(), 3)
+	assert.Equal(t, modFile.Dependencies.Deps.GetOrDefault("name", TestPkgDependency).Name, "name")
+	assert.Equal(t, modFile.Dependencies.Deps.GetOrDefault("name", TestPkgDependency).Source.Git.Url, "test_url")
+	assert.Equal(t, modFile.Dependencies.Deps.GetOrDefault("name", TestPkgDependency).Source.Git.Tag, "test_tag")
+	assert.Equal(t, modFile.Dependencies.Deps.GetOrDefault("name", TestPkgDependency).FullName, "name_test_tag")
 
-	assert.Equal(t, modFile.Dependencies.Deps["oci_name"].Name, "oci_name")
-	assert.Equal(t, modFile.Dependencies.Deps["oci_name"].Version, "oci_tag")
-	assert.Equal(t, modFile.Dependencies.Deps["oci_name"].Source.Oci.Tag, "oci_tag")
+	assert.Equal(t, modFile.Dependencies.Deps.GetOrDefault("oci_name", TestPkgDependency).Name, "oci_name")
+	assert.Equal(t, modFile.Dependencies.Deps.GetOrDefault("oci_name", TestPkgDependency).Version, "oci_tag")
+	assert.Equal(t, modFile.Dependencies.Deps.GetOrDefault("oci_name", TestPkgDependency).Source.Registry.Tag, "oci_tag")
+	assert.Equal(t, err, nil)
+
+	assert.Equal(t, modFile.Dependencies.Deps.GetOrDefault("helloworld", TestPkgDependency).Name, "helloworld")
+	assert.Equal(t, modFile.Dependencies.Deps.GetOrDefault("helloworld", TestPkgDependency).Version, "0.1.2")
+	assert.Equal(t, modFile.Dependencies.Deps.GetOrDefault("helloworld", TestPkgDependency).Source.Oci.Tag, "0.1.2")
 	assert.Equal(t, err, nil)
 }
 
@@ -185,21 +191,21 @@ func TestLoadLockDeps(t *testing.T) {
 	testPath := getTestDir("load_lock_file")
 	deps, err := LoadLockDeps(testPath)
 
-	assert.Equal(t, len(deps.Deps), 2)
-	assert.Equal(t, deps.Deps["name"].Name, "name")
-	assert.Equal(t, deps.Deps["name"].Version, "test_version")
-	assert.Equal(t, deps.Deps["name"].Sum, "test_sum")
-	assert.Equal(t, deps.Deps["name"].Source.Git.Url, "test_url")
-	assert.Equal(t, deps.Deps["name"].Source.Git.Tag, "test_tag")
-	assert.Equal(t, deps.Deps["name"].FullName, "test_version")
+	assert.Equal(t, deps.Deps.Len(), 2)
+	assert.Equal(t, deps.Deps.GetOrDefault("name", TestPkgDependency).Name, "name")
+	assert.Equal(t, deps.Deps.GetOrDefault("name", TestPkgDependency).Version, "test_version")
+	assert.Equal(t, deps.Deps.GetOrDefault("name", TestPkgDependency).Sum, "test_sum")
+	assert.Equal(t, deps.Deps.GetOrDefault("name", TestPkgDependency).Source.Git.Url, "test_url")
+	assert.Equal(t, deps.Deps.GetOrDefault("name", TestPkgDependency).Source.Git.Tag, "test_tag")
+	assert.Equal(t, deps.Deps.GetOrDefault("name", TestPkgDependency).FullName, "test_version")
 
-	assert.Equal(t, deps.Deps["oci_name"].Name, "oci_name")
-	assert.Equal(t, deps.Deps["oci_name"].Version, "test_version")
-	assert.Equal(t, deps.Deps["oci_name"].Sum, "test_sum")
-	assert.Equal(t, deps.Deps["oci_name"].Source.Oci.Reg, "test_reg")
-	assert.Equal(t, deps.Deps["oci_name"].Source.Oci.Repo, "test_repo")
-	assert.Equal(t, deps.Deps["oci_name"].Source.Oci.Tag, "test_oci_tag")
-	assert.Equal(t, deps.Deps["oci_name"].FullName, "test_version")
+	assert.Equal(t, deps.Deps.GetOrDefault("oci_name", TestPkgDependency).Name, "oci_name")
+	assert.Equal(t, deps.Deps.GetOrDefault("oci_name", TestPkgDependency).Version, "test_version")
+	assert.Equal(t, deps.Deps.GetOrDefault("oci_name", TestPkgDependency).Sum, "test_sum")
+	assert.Equal(t, deps.Deps.GetOrDefault("oci_name", TestPkgDependency).Source.Oci.Reg, "test_reg")
+	assert.Equal(t, deps.Deps.GetOrDefault("oci_name", TestPkgDependency).Source.Oci.Repo, "test_repo")
+	assert.Equal(t, deps.Deps.GetOrDefault("oci_name", TestPkgDependency).Source.Oci.Tag, "test_oci_tag")
+	assert.Equal(t, deps.Deps.GetOrDefault("oci_name", TestPkgDependency).FullName, "test_version")
 	assert.Equal(t, err, nil)
 }
 
@@ -214,7 +220,8 @@ func TestStoreModFile(t *testing.T) {
 		},
 	}
 
-	_ = mfile.StoreModFile()
+	err := mfile.StoreModFile()
+	assert.Equal(t, err, nil)
 
 	expect, _ := os.ReadFile(filepath.Join(testPath, "expected.toml"))
 	got, _ := os.ReadFile(filepath.Join(testPath, "kcl.mod"))
@@ -228,4 +235,17 @@ func TestGetFilePath(t *testing.T) {
 	}
 	assert.Equal(t, mfile.GetModFilePath(), filepath.Join(testPath, MOD_FILE))
 	assert.Equal(t, mfile.GetModLockFilePath(), filepath.Join(testPath, MOD_LOCK_FILE))
+}
+
+func TestGenSource(t *testing.T) {
+	src, err := GenSource("git", "https://github.com/kcl-lang/kcl", "0.8.7")
+	assert.Equal(t, err, nil)
+	assert.Equal(t, src.Git.Url, "https://github.com/kcl-lang/kcl")
+	assert.Equal(t, src.Git.Tag, "0.8.7")
+
+	src, err = GenSource("oci", "oci://ghcr.io/kcl-lang/k8s", "1.24")
+	assert.Equal(t, err, nil)
+	assert.Equal(t, src.Oci.Reg, "ghcr.io")
+	assert.Equal(t, src.Oci.Repo, "kcl-lang/k8s")
+	assert.Equal(t, src.Oci.Tag, "1.24")
 }

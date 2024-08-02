@@ -12,7 +12,6 @@ import (
 	"kcl-lang.io/kpm/pkg/errors"
 	"kcl-lang.io/kpm/pkg/oci"
 	"kcl-lang.io/kpm/pkg/opt"
-	pkg "kcl-lang.io/kpm/pkg/package"
 	"kcl-lang.io/kpm/pkg/reporter"
 	"kcl-lang.io/kpm/pkg/runner"
 	"kcl-lang.io/kpm/pkg/utils"
@@ -69,6 +68,10 @@ func RunPkgInPath(opts *opt.CompileOptions) (string, error) {
 // CompileWithOpt will compile the kcl program without kcl package.
 // Deprecated: This method will not be maintained in the future. Use RunWithOpts instead.
 func RunWithOpt(opts *opt.CompileOptions) (*kcl.KCLResultList, error) {
+	// The entries will override the entries in the settings file.
+	if opts.HasSettingsYaml() && len(opts.KFilenameList) > 0 && len(opts.Entries()) > 0 {
+		opts.KFilenameList = []string{}
+	}
 	if len(opts.Entries()) > 0 {
 		for _, entry := range opts.Entries() {
 			if filepath.IsAbs(entry) {
@@ -194,7 +197,7 @@ func RunOciPkg(ociRef, version string, opts *opt.CompileOptions) (*kcl.KCLResult
 	// clean the temp dir.
 	defer os.RemoveAll(tmpDir)
 
-	localPath := ociOpts.AddStoragePathSuffix(tmpDir)
+	localPath := ociOpts.SanitizePathWithSuffix(tmpDir)
 
 	// 2. Pull the tar.
 	err = oci.Pull(localPath, ociOpts.Reg, ociOpts.Repo, ociOpts.Tag, kpmcli.GetSettings())
@@ -238,7 +241,7 @@ func run(kpmcli *client.KpmClient, opts *opt.CompileOptions) (*kcl.KCLResultList
 		return nil, reporter.NewErrorEvent(reporter.Bug, err, "internal bugs, please contact us to fix it.")
 	}
 
-	kclPkg, err := pkg.LoadKclPkg(pkgPath)
+	kclPkg, err := kpmcli.LoadPkgFromPath(pkgPath)
 	if err != nil {
 		return nil, err
 	}

@@ -55,6 +55,11 @@ const (
 	FailedLoadCredential
 	FailedCreateOciClient
 	FailedSelectLatestVersion
+	FailedSelectLatestCompatibleVersion
+	FailedGetReleases
+	FailedTopologicalSort
+	FailedGetVertexProperties
+	FailedGenerateSource
 	FailedGetPackageVersions
 	FailedCreateStorePath
 	FailedPush
@@ -81,6 +86,7 @@ const (
 	WithoutGitTag
 	FailedCloneFromGit
 	FailedHashPkg
+	FailedUpdatingBuildList
 	Bug
 
 	// normal event type means the event is a normal event.
@@ -99,6 +105,8 @@ const (
 	DownloadingFromGit
 	LocalPathNotExist
 	PathIsEmpty
+	DependencyNotFoundInOrderedMap
+	DependencyNotSetInOrderedMap
 	ConflictPkgName
 	AddItselfAsDep
 	PkgTagExists
@@ -109,6 +117,7 @@ const (
 	KclModNotFound
 	CompileFailed
 	FailedParseVersion
+	FailedFetchOciManifest
 )
 
 // KpmEvent is the event used to show kpm logs to users.

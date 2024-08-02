@@ -1,5 +1,5 @@
 // Copyright 2023 The KCL Authors. All rights reserved.
-// Deprecated: The entire contents of this file will be deprecated. 
+// Deprecated: The entire contents of this file will be deprecated.
 // Please use the kcl cli - https://github.com/kcl-lang/cli.
 
 package cmd
@@ -8,14 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/urfave/cli/v2"
 	"kcl-lang.io/kpm/pkg/client"
+	"kcl-lang.io/kpm/pkg/constants"
 	"kcl-lang.io/kpm/pkg/env"
 	"kcl-lang.io/kpm/pkg/errors"
 	"kcl-lang.io/kpm/pkg/opt"
-	pkg "kcl-lang.io/kpm/pkg/package"
 	"kcl-lang.io/kpm/pkg/reporter"
 )
 
@@ -32,7 +31,7 @@ func NewAddCmd(kpmcli *client.KpmClient) *cli.Command {
 			},
 			&cli.StringSliceFlag{
 				Name:  "tag",
-				Usage: "Git repository tag",
+				Usage: "Oci or Git repository tag",
 			},
 			&cli.StringSliceFlag{
 				Name:  "commit",
@@ -41,6 +40,10 @@ func NewAddCmd(kpmcli *client.KpmClient) *cli.Command {
 			&cli.BoolFlag{
 				Name:  FLAG_NO_SUM_CHECK,
 				Usage: "do not check the checksum of the package and update kcl.mod.lock",
+			},
+			&cli.StringFlag{
+				Name:  "rename",
+				Usage: "rename the package name in kcl.mod.lock",
 			},
 		},
 
@@ -76,7 +79,7 @@ func KpmAdd(c *cli.Context, kpmcli *client.KpmClient) error {
 		return err
 	}
 
-	kclPkg, err := pkg.LoadKclPkg(pwd)
+	kclPkg, err := kpmcli.LoadPkgFromPath(pwd)
 	if err != nil {
 		return err
 	}
@@ -131,6 +134,7 @@ func onlyOnceOption(c *cli.Context, name string) (string, *reporter.KpmEvent) {
 // parseAddOptions will parse the user cli inputs.
 func parseAddOptions(c *cli.Context, kpmcli *client.KpmClient, localPath string) (*opt.AddOptions, error) {
 	noSumCheck := c.Bool(FLAG_NO_SUM_CHECK)
+	newPkgName := c.String("rename")
 	// parse from 'kpm add -git https://xxx/xxx.git -tag v0.0.1'.
 	if c.NArg() == 0 {
 		gitOpts, err := parseGitRegistryOptions(c)
@@ -142,29 +146,35 @@ func parseAddOptions(c *cli.Context, kpmcli *client.KpmClient, localPath string)
 		}
 		return &opt.AddOptions{
 			LocalPath:    localPath,
+			NewPkgName:   newPkgName,
 			RegistryOpts: *gitOpts,
 			NoSumCheck:   noSumCheck,
 		}, nil
 	} else {
-		localPkg, err := parseLocalPathOptions(c)
-		if err != (*reporter.KpmEvent)(nil) {
-			// parse from 'kpm add xxx:0.0.1'.
-			ociReg, err := parseOciRegistryOptions(c, kpmcli)
-			if err != nil {
+		regOpt, err := opt.NewRegistryOptionsFrom(c.Args().First(), kpmcli.GetSettings())
+
+		if err != nil {
+			return nil, err
+		}
+
+		if regOpt.Oci != nil {
+			tag, err := onlyOnceOption(c, constants.Tag)
+
+			if err != (*reporter.KpmEvent)(nil) {
 				return nil, err
 			}
-			return &opt.AddOptions{
-				LocalPath:    localPath,
-				RegistryOpts: *ociReg,
-				NoSumCheck:   noSumCheck,
-			}, nil
-		} else {
-			return &opt.AddOptions{
-				LocalPath:    localPath,
-				RegistryOpts: *localPkg,
-				NoSumCheck:   noSumCheck,
-			}, nil
+
+			if len(tag) != 0 {
+				regOpt.Oci.Tag = tag
+			}
 		}
+
+		return &opt.AddOptions{
+			LocalPath:    localPath,
+			NewPkgName:   newPkgName,
+			RegistryOpts: *regOpt,
+			NoSumCheck:   noSumCheck,
+		}, nil
 	}
 }
 
@@ -206,56 +216,19 @@ func parseGitRegistryOptions(c *cli.Context) (*opt.RegistryOptions, *reporter.Kp
 }
 
 // parseOciRegistryOptions will parse the oci registry information from user cli inputs.
-func parseOciRegistryOptions(c *cli.Context, kpmcli *client.KpmClient) (*opt.RegistryOptions, error) {
+func parseRegistryOptions(c *cli.Context, kpmcli *client.KpmClient) (*opt.RegistryOptions, error) {
 	ociPkgRef := c.Args().First()
-	name, version, err := parseOciPkgNameAndVersion(ociPkgRef)
+	name, version, err := opt.ParseOciPkgNameAndVersion(ociPkgRef)
 	if err != nil {
 		return nil, err
 	}
 
 	return &opt.RegistryOptions{
-		Oci: &opt.OciOptions{
+		Registry: &opt.OciOptions{
 			Reg:     kpmcli.GetSettings().DefaultOciRegistry(),
 			Repo:    kpmcli.GetSettings().DefaultOciRepo(),
 			PkgName: name,
 			Tag:     version,
 		},
 	}, nil
-}
-
-// parseLocalPathOptions will parse the local path information from user cli inputs.
-func parseLocalPathOptions(c *cli.Context) (*opt.RegistryOptions, *reporter.KpmEvent) {
-	localPath := c.Args().First()
-	if localPath == "" {
-		return nil, reporter.NewErrorEvent(reporter.PathIsEmpty, errors.PathIsEmpty)
-	}
-	// check if the local path exists.
-	if _, err := os.Stat(localPath); os.IsNotExist(err) {
-		return nil, reporter.NewErrorEvent(reporter.LocalPathNotExist, err)
-	} else {
-		return &opt.RegistryOptions{
-			Local: &opt.LocalOptions{
-				Path: localPath,
-			},
-		}, nil
-	}
-}
-
-// parseOciPkgNameAndVersion will parse package name and version
-// from string "<pkg_name>:<pkg_version>".
-func parseOciPkgNameAndVersion(s string) (string, string, error) {
-	parts := strings.Split(s, ":")
-	if len(parts) == 1 {
-		return parts[0], "", nil
-	}
-
-	if len(parts) > 2 {
-		return "", "", reporter.NewErrorEvent(reporter.InvalidPkgRef, fmt.Errorf("invalid oci package reference '%s'", s))
-	}
-
-	if parts[1] == "" {
-		return "", "", reporter.NewErrorEvent(reporter.InvalidPkgRef, fmt.Errorf("invalid oci package reference '%s'", s))
-	}
-
-	return parts[0], parts[1], nil
 }
