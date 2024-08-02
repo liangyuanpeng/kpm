@@ -18,7 +18,7 @@ require (
 	golang.org/x/mod v0.19.0
 	gopkg.in/yaml.v3 v3.0.1
 	gotest.tools/v3 v3.5.1
-	kcl-lang.io/kcl-go v0.10.0-alpha.1.0.20240730084238-c647f95196d2
+	kcl-lang.io/kcl-go v0.10.0-alpha.1.0.20240730131010-e8708330af3f
 )
 
 require (

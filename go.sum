@@ -1300,8 +1300,8 @@ honnef.co/go/tools v0.0.1-2020.1.3/go.mod h1:X/FiERA/W4tHapMX5mGpAtMSVEeEUOyHaw9
 honnef.co/go/tools v0.0.1-2020.1.4/go.mod h1:X/FiERA/W4tHapMX5mGpAtMSVEeEUOyHaw9vFzvIQ3k=
 k8s.io/utils v0.0.0-20230220204549-a5ecb0141aa5 h1:kmDqav+P+/5e1i9tFfHq1qcF3sOrDp+YEkVDAHu7Jwk=
 k8s.io/utils v0.0.0-20230220204549-a5ecb0141aa5/go.mod h1:OLgZIPagt7ERELqWJFomSt595RzquPNLL48iOWgYOg0=
-kcl-lang.io/kcl-go v0.10.0-alpha.1.0.20240730084238-c647f95196d2 h1:GbX+J5OE+sPbFz2HPMD0oDHnvdJB055Il7brmY+5Wsg=
-kcl-lang.io/kcl-go v0.10.0-alpha.1.0.20240730084238-c647f95196d2/go.mod h1:q1NZjPbx9XnR7gd1SEtPng82meJNx8sW/wRcRW8DGJs=
+kcl-lang.io/kcl-go v0.10.0-alpha.1.0.20240730131010-e8708330af3f h1:L5MeKJuxIMC1tzrFHMz6dvfGrHwI7X/isINXz9MPk3c=
+kcl-lang.io/kcl-go v0.10.0-alpha.1.0.20240730131010-e8708330af3f/go.mod h1:q1NZjPbx9XnR7gd1SEtPng82meJNx8sW/wRcRW8DGJs=
 kcl-lang.io/lib v0.10.0-alpha.1 h1:GMVB75Pc1W29gcl1WlVgdgUscH6h+d9No0fzBH0rNYg=
 kcl-lang.io/lib v0.10.0-alpha.1/go.mod h1:tu+tzwGgHLzYZSIxUG/ntipStrxZd6OvutWYPTxS7cs=
 oras.land/oras-go v1.2.5 h1:XpYuAwAb0DfQsunIyMfeET92emK8km3W4yEzZvUbsTo=
