@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"log"
 
 	pkg "kcl-lang.io/kpm/pkg/package"
 	"kcl-lang.io/kpm/pkg/reporter"
@@ -14,6 +15,7 @@ import (
 // indirect dependencies are also synchronized to the lock file by `lockDeps`.
 func (c *KpmClient) ResolvePkgDepsMetadata(kclPkg *pkg.KclPkg, update bool) error {
 	var err error
+	log.Println("is vendor mode:", kclPkg.IsVendorMode())
 	if kclPkg.IsVendorMode() {
 		err = c.VendorDeps(kclPkg)
 	} else {

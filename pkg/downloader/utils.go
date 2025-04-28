@@ -1,7 +1,9 @@
 package downloader
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -55,12 +57,19 @@ func matchesPackageSpec(kclModPath string, modSpec *ModSpec) bool {
 func FindPackageByModSpec(root string, modSpec *ModSpec) (string, error) {
 	var result string
 	var modVersion string
+	b, err2 := json.Marshal(&modSpec)
+	if err2 != nil {
+		return "", err2
+	}
+	log.Println("kpm.FindPackageByModeSpec.modSpec:", string(b))
+	log.Println("kpm.FindPackageByModeSpec.root:", root)
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() {
 			kclModPath := filepath.Join(path, constants.KCL_MOD)
+			log.Println("kpm.kclModPath:", kclModPath)
 			if _, err := os.Stat(kclModPath); err == nil {
 				// If the package name and version are specified,
 				// we can directly check if the kcl.mod file matches the package.
@@ -95,11 +104,15 @@ func FindPackageByModSpec(root string, modSpec *ModSpec) (string, error) {
 						}
 					}
 				}
+			} else {
+				// panic(err)
+				return nil
 			}
 		}
 		return nil
 	})
 
+	log.Println("kpm.FindPackageByModeSpec")
 	if err != nil {
 		return "", err
 	}

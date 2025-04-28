@@ -639,6 +639,7 @@ func FindPackage(root, targetPackage string) (string, error) {
 		}
 		if info.IsDir() {
 			kclModPath := filepath.Join(path, constants.KCL_MOD)
+			log.Println("kpm.kclModPath.1", kclModPath)
 			if _, err := os.Stat(kclModPath); err == nil {
 				if MatchesPackageName(kclModPath, targetPackage) {
 					result = path
@@ -649,6 +650,7 @@ func FindPackage(root, targetPackage string) (string, error) {
 		return nil
 	})
 
+	log.Println("kpm.find package")
 	if err != nil {
 		return "", err
 	}

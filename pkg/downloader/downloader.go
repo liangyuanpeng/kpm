@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -279,6 +280,7 @@ func NewOciDownloader(platform string) *DepDownloader {
 }
 
 func (d *DepDownloader) Download(opts *DownloadOptions) error {
+	log.Println("downloader......")
 	// create a tmp dir to download the oci package.
 	tmpDir, err := os.MkdirTemp("", "")
 	if err != nil {
@@ -290,9 +292,12 @@ func (d *DepDownloader) Download(opts *DownloadOptions) error {
 	// clean the temp dir.
 	defer os.RemoveAll(tmpDir)
 
+	log.Println("downloader2......")
+
 	localPath := opts.LocalPath
 	cacheFullPath := opts.CachePath
-	if ok, err := features.Enabled(features.SupportNewStorage); err == nil && !ok && opts.EnableCache {
+	if ok, err := features.Enabled(features.SupportNewStorage); err == nil && !ok && opts.EnableCache &&
+		utils.DirExists(filepath.Join(localPath, constants.KCL_MOD)) {
 		if utils.DirExists(cacheFullPath) &&
 			// If the version in modspec is empty, meanings the latest version is needed.
 			// The latest version should be requested first and the cache should be updated.
@@ -304,10 +309,12 @@ func (d *DepDownloader) Download(opts *DownloadOptions) error {
 					return err
 				}
 			}
+			log.Printf("here111,cacheFullPath:%s\n|opts.LocalPath:%s\n", cacheFullPath, opts.LocalPath)
 			return nil
 		} else {
 			err := os.MkdirAll(cacheFullPath, 0755)
 			if err != nil {
+				log.Println("here222")
 				return err
 			}
 		}
@@ -317,8 +324,10 @@ func (d *DepDownloader) Download(opts *DownloadOptions) error {
 	// Skip the download process.
 	if utils.DirExists(localPath) &&
 		utils.DirExists(filepath.Join(localPath, constants.KCL_MOD)) {
+		log.Println("here???")
 		return nil
 	} else {
+		log.Println("downloader.begin download")
 		opts.LocalPath = tmpDir
 		// Dispatch the download to the specific downloader by package source.
 		if opts.Source.Oci != nil {
@@ -410,6 +419,8 @@ func (d *OciDownloader) Download(opts *DownloadOptions) error {
 	}
 
 	ociCli.PullOciOptions.Platform = d.Platform
+
+	log.Println("kpm.oci.download.repoPath:", repoPath)
 
 	if len(ociSource.Tag) == 0 {
 		tagSelected, err := ociCli.TheLatestTag()

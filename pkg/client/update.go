@@ -3,6 +3,7 @@ package client
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"path/filepath"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -154,31 +155,39 @@ func (c *KpmClient) Update(options ...UpdateOption) (*pkg.KclPkg, error) {
 	}
 	depResolver.ResolveFuncs = append(depResolver.ResolveFuncs, resolverFunc)
 
+	log.Println("c.homePath:", c.homePath)
 	err := depResolver.Resolve(
 		resolver.WithResolveKclMod(kMod),
 		resolver.WithEnableCache(true),
 		resolver.WithCachePath(c.homePath),
 		resolver.WithOffline(opts.offline),
 	)
+	log.Println("resolve done")
 
 	if err != nil {
+		log.Println("resolve err")
 		return nil, err
 	}
 
 	if opts.updateModFile && utils.DirExists(filepath.Join(kMod.HomePath, constants.KCL_MOD)) {
+		log.Println("UpdateModFile begin")
 		err = kMod.UpdateModFile()
 		if err != nil {
 			return nil, err
 		}
+		log.Println("UpdateModFile done")
 	}
 
 	// Generate file kcl.mod.lock.
 	if !kMod.NoSumCheck && utils.DirExists(filepath.Join(kMod.HomePath, constants.KCL_MOD)) {
+		log.Println("LockDepsVersion begin")
 		err := kMod.LockDepsVersion()
 		if err != nil {
 			return nil, err
 		}
+		log.Println("LockDepsVersion done")
 	}
+	log.Println("kpm.Update done")
 
 	return kMod, nil
 }

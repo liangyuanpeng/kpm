@@ -66,6 +66,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -429,6 +430,7 @@ func (o *RunOptions) applyCompileOptions(source downloader.Source, kclPkg *pkg.K
 		// use the subdirectories specified by 'ModSpec'
 		var err error
 		if pkgSource.ModSpec != nil && pkgSource.ModSpec.Name != "" {
+			log.Printf("kpm.ModSpec:%s\n", pkgSource.ModSpec.Name)
 			sourcePath, err = downloader.FindPackageByModSpec(sourcePath, pkgSource.ModSpec)
 			if err != nil {
 				return false
@@ -614,6 +616,7 @@ func (o *RunOptions) getPkgSource() (*downloader.Source, error) {
 
 // Run runs the kcl package.
 func (c *KpmClient) Run(options ...RunOption) (*kcl.KCLResultList, error) {
+	log.Println("kpm run")
 	opts := &RunOptions{}
 	for _, option := range options {
 		if err := option(opts); err != nil {
@@ -640,6 +643,7 @@ func (c *KpmClient) Run(options ...RunOption) (*kcl.KCLResultList, error) {
 	var res *kcl.KCLResultList
 	err = newVisitor(*pkgSource, c).Visit(pkgSource, func(kclPkg *pkg.KclPkg) error {
 		// Apply the compile options from cli, kcl.yaml or kcl.mod
+		log.Println("kpm.applyCompileOptions")
 		err = opts.applyCompileOptions(*pkgSource, kclPkg, opts.WorkDir)
 		if err != nil {
 			return err
@@ -647,11 +651,13 @@ func (c *KpmClient) Run(options ...RunOption) (*kcl.KCLResultList, error) {
 
 		kclPkg.SetVendorMode(opts.vendor)
 
+		log.Println("kpm.ResolveDepsIntoMap")
 		// Resolve and update the dependencies into a map.
 		pkgMap, err := c.ResolveDepsIntoMap(kclPkg)
 		if err != nil {
 			return err
 		}
+		log.Println("kpm.ResolveDepsIntoMap after")
 
 		// Fill the dependency path.
 		for dName, dPath := range pkgMap {
@@ -662,6 +668,7 @@ func (c *KpmClient) Run(options ...RunOption) (*kcl.KCLResultList, error) {
 			opts.Merge(kcl.WithExternalPkgs(fmt.Sprintf(constants.EXTERNAL_PKGS_ARG_PATTERN, dName, dPath)))
 		}
 
+		log.Println("realy kcl run..")
 		// Compile the kcl package.
 		res, err = kcl.RunWithOpts(*opts.Option)
 		if err != nil {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -43,6 +44,7 @@ func (pv *PkgVisitor) Visit(s *downloader.Source, v visitFunc) error {
 	}
 
 	if s.ModSpec != nil && s.ModSpec.Name != "" {
+		log.Println("kpm.s.ModeSpec.Name2:", s.ModSpec.Name)
 		modPath, err = downloader.FindPackageByModSpec(modPath, s.ModSpec)
 		if err != nil {
 			return err
@@ -260,6 +262,7 @@ func (rv *RemoteVisitor) Visit(s *downloader.Source, v visitFunc) error {
 		return err
 	}
 	if !s.ModSpec.IsNil() {
+		log.Println("kom.modeSpec.!isNil:", modFullPath)
 		modFullPath, err = downloader.FindPackageByModSpec(modFullPath, s.ModSpec)
 		if err != nil {
 			return err
