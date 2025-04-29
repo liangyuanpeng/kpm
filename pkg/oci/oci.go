@@ -19,7 +19,6 @@ import (
 	"github.com/containers/image/v5/types"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/thoas/go-funk"
-	"oras.land/oras-go/pkg/auth"
 	dockerauth "oras.land/oras-go/pkg/auth/docker"
 	remoteauth "oras.land/oras-go/v2/registry/remote/auth"
 
@@ -33,6 +32,7 @@ import (
 	"oras.land/oras-go/v2/content"
 	"oras.land/oras-go/v2/content/file"
 	"oras.land/oras-go/v2/registry/remote"
+	credentials "oras.land/oras-go/v2/registry/remote/credentials"
 	"oras.land/oras-go/v2/registry/remote/errcode"
 )
 
@@ -46,8 +46,41 @@ const (
 // Login will login 'hostname' by 'username' and 'password'.
 func Login(hostname, username, password string, setting *settings.Settings) error {
 
-	authClient, err := dockerauth.NewClientWithDockerFallback(setting.CredentialsFile)
-
+	fallbackStore, err := credentials.NewStoreFromDocker(credentials.StoreOptions{})
+	if err != nil {
+		// panic(err)
+		return reporter.NewErrorEvent(
+			reporter.FailedLogin,
+			err,
+			fmt.Sprintf("failed to login '%s', please check registry, username and password is valid", hostname),
+		)
+	}
+	store, err := credentials.NewStore("example/path/config.json", credentials.StoreOptions{
+		AllowPlaintextPut: true,
+	})
+	if err != nil {
+		// panic(err)
+		return reporter.NewErrorEvent(
+			reporter.FailedLogin,
+			err,
+			fmt.Sprintf("failed to login '%s', please check registry, username and password is valid", hostname),
+		)
+	}
+	registry, err := remote.NewRegistry(hostname)
+	if err != nil {
+		// panic(err)
+		return reporter.NewErrorEvent(
+			reporter.FailedLogin,
+			err,
+			fmt.Sprintf("failed to login '%s', please check registry, username and password is valid", hostname),
+		)
+	}
+	cred := remoteauth.Credential{
+		Username: username,
+		Password: password,
+	}
+	sf := credentials.NewStoreWithFallbacks(store, fallbackStore)
+	err = credentials.Login(context.Background(), sf, registry, cred)
 	if err != nil {
 		return reporter.NewErrorEvent(
 			reporter.FailedLogin,
@@ -55,22 +88,7 @@ func Login(hostname, username, password string, setting *settings.Settings) erro
 			fmt.Sprintf("failed to login '%s', please check registry, username and password is valid", hostname),
 		)
 	}
-
-	err = authClient.LoginWithOpts(
-		[]auth.LoginOption{
-			auth.WithLoginHostname(hostname),
-			auth.WithLoginUsername(username),
-			auth.WithLoginSecret(password),
-		}...,
-	)
-
-	if err != nil {
-		return reporter.NewErrorEvent(
-			reporter.FailedLogin,
-			err,
-			fmt.Sprintf("failed to login '%s', please check registry, username and password is valid", hostname),
-		)
-	}
+	fmt.Println("Login succeeded")
 
 	return nil
 }
@@ -78,17 +96,32 @@ func Login(hostname, username, password string, setting *settings.Settings) erro
 // Logout will logout from registry.
 func Logout(hostname string, setting *settings.Settings) error {
 
-	authClient, err := dockerauth.NewClientWithDockerFallback(setting.CredentialsFile)
-
+	fallbackStore, err := credentials.NewStoreFromDocker(credentials.StoreOptions{})
+	if err != nil {
+		// panic(err)
+		return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
+	}
+	store, err := credentials.NewStore("example/path/config.json", credentials.StoreOptions{})
+	if err != nil {
+		return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
+	}
+	sf := credentials.NewStoreWithFallbacks(store, fallbackStore)
+	err = credentials.Logout(context.Background(), sf, hostname)
 	if err != nil {
 		return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
 	}
 
-	err = authClient.Logout(context.Background(), hostname)
+	// authClient, err := dockerauth.NewClientWithDockerFallback(setting.CredentialsFile)
 
-	if err != nil {
-		return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
-	}
+	// if err != nil {
+	// 	return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
+	// }
+
+	// err = authClient.Logout(context.Background(), hostname)
+
+	// if err != nil {
+	// 	return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
+	// }
 
 	return nil
 }
