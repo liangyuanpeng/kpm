@@ -3,12 +3,10 @@ package client
 import (
 	"bytes"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"kcl-lang.io/kpm/pkg/downloader"
-	"kcl-lang.io/kpm/pkg/mock"
 	pkg "kcl-lang.io/kpm/pkg/package"
 	"kcl-lang.io/kpm/pkg/reporter"
 )
@@ -16,23 +14,24 @@ import (
 // go test -timeout 30s -run ^TestPush$ kcl-lang.io/kpm/pkg/client -v
 func TestPush(t *testing.T) {
 	testFunc := func(t *testing.T, kpmcli *KpmClient) {
-		if runtime.GOOS == "windows" {
-			t.Skip("Skipping test on Windows")
-		}
-		err := mock.StartDockerRegistry()
-		if err != nil {
-			t.Errorf("Error starting docker registry: %v", err)
-		}
+		// if runtime.GOOS == "windows" {
+		// 	t.Skip("Skipping test on Windows")
+		// }
+		// err := mock.StartDockerRegistry()
+		// if err != nil {
+		// 	t.Errorf("Error starting docker registry: %v", err)
+		// }
 
-		defer func() {
-			err = mock.CleanTestEnv()
-			if err != nil {
-				t.Errorf("Error stopping docker registry: %v", err)
-			}
-		}()
+		// defer func() {
+		// 	err = mock.CleanTestEnv()
+		// 	if err != nil {
+		// 		t.Errorf("Error stopping docker registry: %v", err)
+		// 	}
+		// }()
 
 		kpmcli.SetInsecureSkipTLSverify(true)
-		err = kpmcli.LoginOci("localhost:5001", "test", "1234")
+		kpmcli.SetPlainHttp(true)
+		err := kpmcli.LoginOci("192.168.3.187:5001", "test", "1234")
 		if err != nil {
 			t.Errorf("Error logging in to docker registry: %v", err)
 		}
@@ -48,7 +47,7 @@ func TestPush(t *testing.T) {
 			WithPushSource(
 				downloader.Source{
 					Oci: &downloader.Oci{
-						Reg:  "localhost:5001",
+						Reg:  "192.168.3.187:5001",
 						Repo: "test/push_0",
 					},
 				},
@@ -60,7 +59,7 @@ func TestPush(t *testing.T) {
 		}
 
 		assert.Contains(t, buf.String(), "package 'push_0' will be pushed")
-		assert.Contains(t, buf.String(), "pushed [registry] localhost:5001/test/push_0")
+		assert.Contains(t, buf.String(), "pushed [registry] 192.168.3.187:5001/test/push_0")
 		assert.Contains(t, buf.String(), "digest: sha256:")
 
 		testPushModPath := filepath.Join(testDir, "test_pushed_mod")
@@ -78,7 +77,7 @@ func TestPush(t *testing.T) {
 
 		err = kpmcli.Add(
 			WithAddKclPkg(testMod),
-			WithAddSourceUrl("oci://localhost:5001/test/push_0"),
+			WithAddSourceUrl("oci://192.168.3.187:5001/test/push_0"),
 			WithAddModSpec(&downloader.ModSpec{
 				Name:    "push_0",
 				Version: "0.0.1",

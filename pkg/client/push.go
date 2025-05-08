@@ -2,6 +2,7 @@ package client
 
 import (
 	"fmt"
+	"log"
 	"os"
 
 	"kcl-lang.io/kpm/pkg/downloader"
@@ -146,6 +147,7 @@ func (c *KpmClient) pushToOci(localPath string, ociOpts *opt.OciOptions) error {
 		oci.WithRepoPath(repoPath),
 		oci.WithSettings(c.GetSettings()),
 		oci.WithInsecureSkipTLSverify(c.insecureSkipTLSverify),
+		// oci.WithPlainHttp(c.isPlainHttp),
 	)
 
 	if err != nil {
@@ -166,6 +168,7 @@ func (c *KpmClient) pushToOci(localPath string, ociOpts *opt.OciOptions) error {
 		)
 	}
 
+	log.Println("begin push oci manifest")
 	return ociCli.PushWithOciManifest(localPath, ociOpts.Tag, &opt.OciManifestOptions{
 		Annotations: ociOpts.Annotations,
 	})

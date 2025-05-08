@@ -36,9 +36,11 @@ func (c *KpmClient) LoginOci(hostname, username, password string) error {
 	}
 	// log.Println("c.insecureSkipTLSverify:", c.insecureSkipTLSverify)
 	registry.Client = &auth.Client{Cache: auth.NewCache(), Client: &http.Client{Transport: transport}}
-	if !c.insecureSkipTLSverify {
-		registry.PlainHTTP = true
-	}
+	// if c.insecureSkipTLSverify {
+	// 	registry.PlainHTTP = true
+	// }
+	log.Println("c.isPlainHttp:", c.isPlainHttp)
+	registry.PlainHTTP = c.isPlainHttp
 
 	err = credentials.Login(context.Background(), credCli.Store, registry, cred)
 
@@ -50,7 +52,7 @@ func (c *KpmClient) LoginOci(hostname, username, password string) error {
 	if err != nil {
 		return err
 	}
-	log.Println("credCli:", c1.Username)
+	log.Println("credCli.username:", c1.Username)
 
 	return nil
 }

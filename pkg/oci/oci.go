@@ -158,6 +158,7 @@ func WithRepoPath(repoPath string) OciClientOption {
 		if err != nil {
 			return fmt.Errorf("repository '%s' not found", repoPath)
 		}
+		// c.repo.PlainHTTP = *c.isPlainHttp
 		return nil
 	}
 }
@@ -223,6 +224,7 @@ func NewOciClientWithOpts(opts ...OciClientOption) (*OciClient, error) {
 		// Set the default value of the plain http
 		registry := client.repo.Reference.String()
 		host, _, _ := net.SplitHostPort(registry)
+		client.repo.PlainHTTP = false
 		if host == "localhost" || registry == "localhost" {
 			// not specified, defaults to plain http for localhost
 			client.repo.PlainHTTP = true
@@ -301,6 +303,7 @@ func (ociClient *OciClient) Pull(localPath, tag string) error {
 func (ociClient *OciClient) TheLatestTag() (string, error) {
 	var tagSelected string
 
+	ociClient.repo.PlainHTTP = true
 	err := ociClient.repo.Tags(*ociClient.ctx, "", func(tags []string) error {
 		var err error
 		tagSelected, err = semver.LatestVersion(tags)
@@ -341,6 +344,7 @@ func RepoIsNotExist(err error) bool {
 func (ociClient *OciClient) ContainsTag(tag string) (bool, *reporter.KpmEvent) {
 	var exists bool
 
+	ociClient.repo.PlainHTTP = true
 	err := ociClient.repo.Tags(*ociClient.ctx, "", func(tags []string) error {
 		exists = funk.ContainsString(tags, tag)
 		return nil

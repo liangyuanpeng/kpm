@@ -36,6 +36,7 @@ type KpmClient struct {
 	noSumCheck bool
 	// The flag of whether to skip the verification of TLS.
 	insecureSkipTLSverify bool
+	isPlainHttp           bool
 }
 
 // NewKpmClient will create a new kpm client with default settings.
@@ -68,6 +69,10 @@ func NewKpmClient() (*KpmClient, error) {
 // SetInsecureSkipTLSverify will set the flag of whether to skip the verification of TLS.
 func (c *KpmClient) SetInsecureSkipTLSverify(insecureSkipTLSverify bool) {
 	c.insecureSkipTLSverify = insecureSkipTLSverify
+}
+
+func (c *KpmClient) SetPlainHttp(isPlainHttp bool) {
+	c.isPlainHttp = isPlainHttp
 }
 
 // SetNoSumCheck will set the 'noSumCheck' flag.
