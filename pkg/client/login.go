@@ -34,7 +34,7 @@ func (c *KpmClient) LoginOci(hostname, username, password string) error {
 	transport := &http.Transport{
 		TLSClientConfig: tlsConfig,
 	}
-	log.Println("c.insecureSkipTLSverify:", c.insecureSkipTLSverify)
+	// log.Println("c.insecureSkipTLSverify:", c.insecureSkipTLSverify)
 	registry.Client = &auth.Client{Cache: auth.NewCache(), Client: &http.Client{Transport: transport}}
 	if !c.insecureSkipTLSverify {
 		registry.PlainHTTP = true
