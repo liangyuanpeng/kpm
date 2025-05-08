@@ -39,7 +39,7 @@ func TestLogin(t *testing.T) {
 	userPwd := "invalid_password"
 
 	err := Login(hostName, userName, userPwd, &settings)
-	assert.Equal(t, err.Error(), "failed to login 'ghcr.io', please check registry, username and password is valid\nGet \"https://ghcr.io/v2/\": denied: denied\n")
+	assert.Equal(t, err.Error(), "failed to login 'ghcr.io', please check registry, username and password is valid\nfailed to validate the credentials for ghcr.io: GET \"https://ghcr.io/v2/\": GET \"https://ghcr.io/token?scope=repository%3Auser%2Fimage%3Apull&service=ghcr.io\": response status code 403: denied: denied\n")
 }
 
 func TestPull(t *testing.T) {
