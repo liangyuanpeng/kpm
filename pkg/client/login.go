@@ -1,10 +1,11 @@
 package client
 
 import (
-	"fmt"
+	"context"
 
-	"kcl-lang.io/kpm/pkg/reporter"
-	"oras.land/oras-go/pkg/auth"
+	"oras.land/oras-go/v2/registry/remote"
+	remoteauth "oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/credentials"
 )
 
 // LoginOci will login to the oci registry.
@@ -14,20 +15,18 @@ func (c *KpmClient) LoginOci(hostname, username, password string) error {
 		return err
 	}
 
-	err = credCli.GetAuthClient().LoginWithOpts(
-		[]auth.LoginOption{
-			auth.WithLoginHostname(hostname),
-			auth.WithLoginUsername(username),
-			auth.WithLoginSecret(password),
-		}...,
-	)
+	registry, err := remote.NewRegistry(hostname)
+	if err != nil {
+		return err
+	}
+	cred := remoteauth.Credential{
+		Username: username,
+		Password: password,
+	}
+	err = credentials.Login(context.Background(), credCli.Store, registry, cred)
 
 	if err != nil {
-		return reporter.NewErrorEvent(
-			reporter.FailedLogin,
-			err,
-			fmt.Sprintf("failed to login '%s', please check registry, username and password is valid", hostname),
-		)
+		return err
 	}
 
 	return nil
