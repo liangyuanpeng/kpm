@@ -100,7 +100,9 @@ func Logout(hostname string, setting *settings.Settings) error {
 		// panic(err)
 		return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
 	}
-	store, err := credentials.NewStore(setting.CredentialsFile, credentials.StoreOptions{})
+	store, err := credentials.NewStore(setting.CredentialsFile, credentials.StoreOptions{
+		AllowPlaintextPut: true,
+	})
 	if err != nil {
 		return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
 	}
