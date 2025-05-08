@@ -1,10 +1,15 @@
 package client
 
 import (
+	"context"
+	"crypto/tls"
 	"fmt"
+	"net/http"
 
 	"kcl-lang.io/kpm/pkg/reporter"
-	"oras.land/oras-go/pkg/auth"
+	"oras.land/oras-go/v2/registry/remote"
+	remoteauth "oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/credentials"
 )
 
 // LoginOci will login to the oci registry.
@@ -14,13 +19,28 @@ func (c *KpmClient) LoginOci(hostname, username, password string) error {
 		return err
 	}
 
-	err = credCli.GetAuthClient().LoginWithOpts(
-		[]auth.LoginOption{
-			auth.WithLoginHostname(hostname),
-			auth.WithLoginUsername(username),
-			auth.WithLoginSecret(password),
-		}...,
-	)
+	registry, err := remote.NewRegistry(hostname)
+	if err != nil {
+		return err
+	}
+	cred := remoteauth.Credential{
+		Username: username,
+		Password: password,
+	}
+
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: c.insecureSkipTLSverify,
+	}
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+	registry.Client = &remoteauth.Client{Cache: remoteauth.NewCache(), Client: &http.Client{Transport: transport}}
+	if hostname == "localhost:5001" {
+		c.isPlainHttp = true
+	}
+	registry.PlainHTTP = c.isPlainHttp
+
+	err = credentials.Login(context.Background(), credCli.Store, registry, cred)
 
 	if err != nil {
 		return reporter.NewErrorEvent(

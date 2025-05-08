@@ -8,6 +8,7 @@ on:
   push:
     branches:
      - main
+     - cleanup_orasv1_login
 
 jobs:
   Test:

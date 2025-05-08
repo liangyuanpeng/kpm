@@ -1,15 +1,19 @@
 package downloader
 
 import (
+	"context"
 	"fmt"
 
 	dockerauth "oras.land/oras-go/pkg/auth/docker"
 	remoteauth "oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/credentials"
+	orascredentials "oras.land/oras-go/v2/registry/remote/credentials"
 )
 
 // CredClient is the client to get the credentials.
 type CredClient struct {
 	credsClient *dockerauth.Client
+	Store       *orascredentials.DynamicStore
 }
 
 // LoadCredentialFile loads the credential file and return the CredClient.
@@ -22,9 +26,16 @@ func LoadCredentialFile(filepath string) (*CredClient, error) {
 	if !ok {
 		return nil, fmt.Errorf("authClient is not *docker.Client type")
 	}
+	store, err := credentials.NewStore(filepath, credentials.StoreOptions{
+		AllowPlaintextPut: true,
+	})
+	if err != nil {
+		return nil, err
+	}
 
 	return &CredClient{
 		credsClient: dockerAuthClient,
+		Store:       store,
 	}, nil
 }
 
@@ -38,13 +49,13 @@ func (cred *CredClient) Credential(hostName string) (*remoteauth.Credential, err
 	if len(hostName) == 0 {
 		return nil, fmt.Errorf("hostName is empty")
 	}
-	username, password, err := cred.credsClient.Credential(hostName)
+	remoteauth1, err := cred.Store.Get(context.Background(), hostName)
 	if err != nil {
 		return nil, err
 	}
 
 	return &remoteauth.Credential{
-		Username: username,
-		Password: password,
+		Username: remoteauth1.Username,
+		Password: remoteauth1.Password,
 	}, nil
 }
