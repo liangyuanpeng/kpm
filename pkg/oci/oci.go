@@ -45,7 +45,9 @@ const (
 // Login will login 'hostname' by 'username' and 'password'.
 func Login(hostname, username, password string, setting *settings.Settings) error {
 
-	fallbackStore, err := credentials.NewStoreFromDocker(credentials.StoreOptions{})
+	fallbackStore, err := credentials.NewStoreFromDocker(credentials.StoreOptions{
+		AllowPlaintextPut: true,
+	})
 	if err != nil {
 		// panic(err)
 		return reporter.NewErrorEvent(
