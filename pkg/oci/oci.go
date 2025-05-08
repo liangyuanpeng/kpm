@@ -54,7 +54,7 @@ func Login(hostname, username, password string, setting *settings.Settings) erro
 			fmt.Sprintf("failed to login '%s', please check registry, username and password is valid", hostname),
 		)
 	}
-	store, err := credentials.NewStore("example/path/config.json", credentials.StoreOptions{
+	store, err := credentials.NewStore(setting.CredentialsFile, credentials.StoreOptions{
 		AllowPlaintextPut: true,
 	})
 	if err != nil {
@@ -100,7 +100,7 @@ func Logout(hostname string, setting *settings.Settings) error {
 		// panic(err)
 		return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
 	}
-	store, err := credentials.NewStore("example/path/config.json", credentials.StoreOptions{})
+	store, err := credentials.NewStore(setting.CredentialsFile, credentials.StoreOptions{})
 	if err != nil {
 		return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
 	}
