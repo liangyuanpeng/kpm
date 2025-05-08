@@ -1,4 +1,16 @@
 # 分支名
+$:
+  vscode:
+    - docker:
+        # 指定开发环境镜像，可以是任意可访问的镜像
+        image: gitpod/workspace-full:2025-04-16-08-49-20
+      services:
+        - vscode
+        - docker
+      # 开发环境启动后会执行的任务
+      stages:
+        - name: ls
+          script: apt update -y && apt install -y make git
 mvp:
   # 事件名
   push:
