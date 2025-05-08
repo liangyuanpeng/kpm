@@ -80,6 +80,7 @@ func Login(hostname, username, password string, setting *settings.Settings) erro
 		Username: username,
 		Password: password,
 	}
+	registry.PlainHTTP = true
 	sf := credentials.NewStoreWithFallbacks(store, fallbackStore)
 	err = credentials.Login(context.Background(), sf, registry, cred)
 	if err != nil {

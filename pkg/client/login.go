@@ -39,7 +39,9 @@ func (c *KpmClient) LoginOci(hostname, username, password string) error {
 	// if c.insecureSkipTLSverify {
 	// 	registry.PlainHTTP = true
 	// }
-	log.Println("c.isPlainHttp:", c.isPlainHttp)
+	if hostname == "localhost:5001" {
+		c.isPlainHttp = true
+	}
 	registry.PlainHTTP = c.isPlainHttp
 
 	err = credentials.Login(context.Background(), credCli.Store, registry, cred)
