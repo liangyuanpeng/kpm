@@ -426,7 +426,7 @@ func (ociClient *OciClient) FetchManifestIntoJsonStr(opts opt.OciFetchOptions) (
 
 func loadCredential(hostName string, settings *settings.Settings) (*remoteauth.Credential, error) {
 
-	store, err := credentials.NewStore("example/path/config.json", credentials.StoreOptions{})
+	store, err := credentials.NewStore(settings.CredentialsFile, credentials.StoreOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -434,7 +434,7 @@ func loadCredential(hostName string, settings *settings.Settings) (*remoteauth.C
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &remoteauth.Credential{
 		Username: c.Username,
 		Password: c.Password,
