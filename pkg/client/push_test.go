@@ -3,10 +3,12 @@ package client
 import (
 	"bytes"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"kcl-lang.io/kpm/pkg/downloader"
+	"kcl-lang.io/kpm/pkg/mock"
 	pkg "kcl-lang.io/kpm/pkg/package"
 	"kcl-lang.io/kpm/pkg/reporter"
 )
@@ -14,23 +16,23 @@ import (
 // go test -timeout 30s -run ^TestPush$ kcl-lang.io/kpm/pkg/client -v
 func TestPush(t *testing.T) {
 	testFunc := func(t *testing.T, kpmcli *KpmClient) {
-		// if runtime.GOOS == "windows" {
-		// 	t.Skip("Skipping test on Windows")
-		// }
-		// err := mock.StartDockerRegistry()
-		// if err != nil {
-		// 	t.Errorf("Error starting docker registry: %v", err)
-		// }
+		if runtime.GOOS == "windows" {
+			t.Skip("Skipping test on Windows")
+		}
+		err := mock.StartDockerRegistry()
+		if err != nil {
+			t.Errorf("Error starting docker registry: %v", err)
+		}
 
 		defer func() {
-			// err = mock.CleanTestEnv()
-			// if err != nil {
-			// 	t.Errorf("Error stopping docker registry: %v", err)
-			// }
+			err = mock.CleanTestEnv()
+			if err != nil {
+				t.Errorf("Error stopping docker registry: %v", err)
+			}
 		}()
 
 		kpmcli.SetInsecureSkipTLSverify(true)
-		err := kpmcli.LoginOci("192.168.3.187:5001", "test", "1234")
+		err = kpmcli.LoginOci("192.168.3.187:5001", "test", "1234")
 		if err != nil {
 			t.Errorf("Error logging in to docker registry: %v", err)
 		}
