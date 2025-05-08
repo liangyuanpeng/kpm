@@ -19,7 +19,6 @@ import (
 	"github.com/containers/image/v5/types"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/thoas/go-funk"
-	dockerauth "oras.land/oras-go/pkg/auth/docker"
 	remoteauth "oras.land/oras-go/v2/registry/remote/auth"
 
 	"kcl-lang.io/kpm/pkg/opt"
@@ -110,18 +109,6 @@ func Logout(hostname string, setting *settings.Settings) error {
 	if err != nil {
 		return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
 	}
-
-	// authClient, err := dockerauth.NewClientWithDockerFallback(setting.CredentialsFile)
-
-	// if err != nil {
-	// 	return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
-	// }
-
-	// err = authClient.Logout(context.Background(), hostname)
-
-	// if err != nil {
-	// 	return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
-	// }
 
 	return nil
 }
@@ -438,20 +425,21 @@ func (ociClient *OciClient) FetchManifestIntoJsonStr(opts opt.OciFetchOptions) (
 }
 
 func loadCredential(hostName string, settings *settings.Settings) (*remoteauth.Credential, error) {
-	authClient, err := dockerauth.NewClientWithDockerFallback(settings.CredentialsFile)
-	if err != nil {
-		return nil, err
-	}
-	dockerClient, _ := authClient.(*dockerauth.Client)
-	username, password, err := dockerClient.Credential(hostName)
-	if err != nil {
-		return nil, err
-	}
 
+	store, err := credentials.NewStore("example/path/config.json", credentials.StoreOptions{})
+	if err != nil {
+		return nil, err
+	}
+	c, err := store.Get(context.TODO(), hostName)
+	if err != nil {
+		return nil, err
+	}
+	
 	return &remoteauth.Credential{
-		Username: username,
-		Password: password,
+		Username: c.Username,
+		Password: c.Password,
 	}, nil
+
 }
 
 // Pull will pull the oci artifacts from oci registry to local path.
