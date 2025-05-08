@@ -1,0 +1,12 @@
+# 分支名
+mvp:
+  # 事件名
+  push:
+    # 要执行的任务
+    - docker:
+        image: gitpod/workspace-full:2025-04-16-08-49-20
+      stages:
+        - name: apt
+          script: apt update -y && apt install -y make git
+        - name: make
+          script: echo ""
