@@ -97,7 +97,9 @@ func Login(hostname, username, password string, setting *settings.Settings) erro
 // Logout will logout from registry.
 func Logout(hostname string, setting *settings.Settings) error {
 
-	fallbackStore, err := credentials.NewStoreFromDocker(credentials.StoreOptions{})
+	fallbackStore, err := credentials.NewStoreFromDocker(credentials.StoreOptions{
+		AllowPlaintextPut: true,
+	})
 	if err != nil {
 		// panic(err)
 		return reporter.NewErrorEvent(reporter.FailedLogout, err, fmt.Sprintf("failed to logout '%s'", hostname))
