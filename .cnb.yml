@@ -3,7 +3,7 @@ $:
   vscode:
     - docker:
         # 指定开发环境镜像，可以是任意可访问的镜像
-        image: gitpod/workspace-full:2025-04-16-08-49-20
+        image: gitpod/workspace-full:2025-04-07-09-59-40
       services:
         - vscode
         - docker
