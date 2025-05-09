@@ -71,9 +71,9 @@ func (c *KpmClient) SetInsecureSkipTLSverify(insecureSkipTLSverify bool) {
 	c.insecureSkipTLSverify = insecureSkipTLSverify
 }
 
-func (c *KpmClient) SetPlainHttp(isPlainHttp bool) {
-	c.isPlainHttp = isPlainHttp
-}
+// func (c *KpmClient) SetPlainHttp(isPlainHttp bool) {
+// 	c.isPlainHttp = isPlainHttp
+// }
 
 // SetNoSumCheck will set the 'noSumCheck' flag.
 func (c *KpmClient) SetNoSumCheck(noSumCheck bool) {

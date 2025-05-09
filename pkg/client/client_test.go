@@ -2180,6 +2180,7 @@ func testRunWithInsecureSkipTLSverify(t *testing.T) {
 	assert.Equal(t, buf.String(), "")
 
 	kpmcli.SetInsecureSkipTLSverify(true)
+	kpmcli.SetPlainHttp(true)
 	_, _ = kpmcli.Run(
 		WithRunSourceUrl(turl.String()),
 	)
