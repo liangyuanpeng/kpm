@@ -225,7 +225,7 @@ func NewOciClientWithOpts(opts ...OciClientOption) (*OciClient, error) {
 		// Set the default value of the plain http
 		registry := client.repo.Reference.String()
 		host, _, _ := net.SplitHostPort(registry)
-		client.repo.PlainHTTP = false
+		// client.repo.PlainHTTP = false
 		if host == "localhost" || registry == "localhost" {
 			// not specified, defaults to plain http for localhost
 			client.repo.PlainHTTP = true

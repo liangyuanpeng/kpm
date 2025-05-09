@@ -21,6 +21,7 @@ func getTestDir(subDir string) string {
 	return testDir
 }
 
+// go test -timeout 30s -run ^TestLogin$ kcl-lang.io/kpm/pkg/oci -v
 func TestLogin(t *testing.T) {
 	testPath := getTestDir("test_login")
 	testConfPath := filepath.Join(testPath, "config.json")
@@ -35,7 +36,7 @@ func TestLogin(t *testing.T) {
 	}
 
 	hostName := "ghcr.io"
-	userName := "invalid_username"
+	userName := ""
 	userPwd := "invalid_password"
 
 	err := Login(hostName, userName, userPwd, &settings)
