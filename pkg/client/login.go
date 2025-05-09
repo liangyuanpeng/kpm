@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"log"
+	"net"
 	"net/http"
 
 	"oras.land/oras-go/v2/registry/remote"
@@ -39,10 +40,26 @@ func (c *KpmClient) LoginOci(hostname, username, password string) error {
 	// if c.insecureSkipTLSverify {
 	// 	registry.PlainHTTP = true
 	// }
-	if hostname == "localhost:5001" {
-		c.isPlainHttp = true
+	// if hostname == "localhost:5001" {
+	// 	c.isPlainHttp = true
+	// }
+	// registry.PlainHTTP = c.isPlainHttp
+
+	host, _, _ := net.SplitHostPort(hostname)
+	// client.repo.PlainHTTP = false
+	if host == "localhost" {
+		// not specified, defaults to plain http for localhost
+		registry.PlainHTTP = true
 	}
-	registry.PlainHTTP = c.isPlainHttp
+
+	// If the plain http is specified in the settings file
+	// Override the default value of the plain http
+	if c.GetSettings() != nil {
+		isPlainHttp, force := c.GetSettings().ForceOciPlainHttp()
+		if force {
+			registry.PlainHTTP = isPlainHttp
+		}
+	}
 
 	err = credentials.Login(context.Background(), credCli.Store, registry, cred)
 

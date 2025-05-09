@@ -36,7 +36,7 @@ type KpmClient struct {
 	noSumCheck bool
 	// The flag of whether to skip the verification of TLS.
 	insecureSkipTLSverify bool
-	isPlainHttp           bool
+	// isPlainHttp           bool
 }
 
 // NewKpmClient will create a new kpm client with default settings.

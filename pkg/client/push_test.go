@@ -32,7 +32,7 @@ func TestPush(t *testing.T) {
 		}()
 
 		kpmcli.SetInsecureSkipTLSverify(true)
-		kpmcli.SetPlainHttp(true)
+		// kpmcli.SetPlainHttp(true)
 		err = kpmcli.LoginOci("localhost:5001", "test", "1234")
 		if err != nil {
 			t.Errorf("Error logging in to docker registry: %v", err)
