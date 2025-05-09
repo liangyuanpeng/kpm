@@ -36,7 +36,7 @@ func TestLogin(t *testing.T) {
 	}
 
 	hostName := "ghcr.io"
-	userName := ""
+	userName := "invalid_username"
 	userPwd := "invalid_password"
 
 	err := Login(hostName, userName, userPwd, &settings)
