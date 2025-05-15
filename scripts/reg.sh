@@ -14,7 +14,7 @@ if [ "$(docker ps -aq -f name=kcl-registry)" ]; then
 fi
 
 # start the Docker Registry with authentication
-docker run -p 5001:5000 \
+docker run -p 5002:5002 \
 --restart=always \
 --name kcl-registry \
 -v /var/lib/registry:/var/lib/registry \
@@ -22,6 +22,7 @@ docker run -p 5001:5000 \
 -e "REGISTRY_AUTH=htpasswd" \
 -e "REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm" \
 -e "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd" \
+-e "REGISTRY_HTTP_ADDR=:5002" \
 -d registry
 
 # clean the registry
