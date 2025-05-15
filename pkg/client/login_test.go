@@ -25,9 +25,6 @@ func TestLogin(t *testing.T) {
 	}()
 
 	kpmcli, err := NewKpmClient()
-	if err != nil {
-		// reporter.Fatal(err)
-		panic(err)
-	}
+	assert.Equal(t, err, nil)
 	kpmcli.LoginOci("172.88.0.8:5002", "test", "1234")
 }
