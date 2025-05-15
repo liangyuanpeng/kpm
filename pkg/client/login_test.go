@@ -30,5 +30,5 @@ func TestLogin(t *testing.T) {
 	assert.Equal(t, err, nil)
 	err = kpmcli.LoginOci("172.88.0.8:5002", "test", "1234")
 	assert.Equal(t, err, nil)
-	// os.Unsetenv("OCI_REG_PLAIN_HTTP")
+	os.Unsetenv("OCI_REG_PLAIN_HTTP")
 }
