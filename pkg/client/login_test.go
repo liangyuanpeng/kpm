@@ -28,6 +28,7 @@ func TestLogin(t *testing.T) {
 	os.Setenv("OCI_REG_PLAIN_HTTP", "ON")
 	kpmcli, err := NewKpmClient()
 	assert.Equal(t, err, nil)
-	kpmcli.LoginOci("172.88.0.8:5002", "test", "1234")
-	os.Unsetenv("OCI_REG_PLAIN_HTTP")
+	err = kpmcli.LoginOci("172.88.0.8:5002", "test", "1234")
+	assert.Equal(t, err, nil)
+	// os.Unsetenv("OCI_REG_PLAIN_HTTP")
 }
