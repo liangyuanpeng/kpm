@@ -19,10 +19,6 @@ import (
 	"github.com/containers/image/v5/types"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/thoas/go-funk"
-<<<<<<< HEAD
-	dockerauth "oras.land/oras-go/pkg/auth/docker"
-=======
->>>>>>> b138e67 (cleanup oras v1)
 	remoteauth "oras.land/oras-go/v2/registry/remote/auth"
 
 	"kcl-lang.io/kpm/pkg/opt"
