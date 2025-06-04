@@ -13,6 +13,7 @@ import (
 	"kcl-lang.io/kpm/pkg/reporter"
 )
 
+// go test -timeout 30s -run ^TestPush$ kcl-lang.io/kpm/pkg/client -v
 func TestPush(t *testing.T) {
 	testFunc := func(t *testing.T, kpmcli *KpmClient) {
 		if runtime.GOOS == "windows" {

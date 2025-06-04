@@ -1,2 +1,1 @@
-failed to login 'ghcr.io', please check registry, username and password is valid
-Get "https://ghcr.io/v2/": unsupported
+failed to validate the credentials for ghcr.io: GET "https://ghcr.io/v2/": GET "https://ghcr.io/token?scope=repository%3Auser%2Fimage%3Apull&service=ghcr.io": response status code 403: denied: requested access to the resource is denied

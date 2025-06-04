@@ -1,10 +1,16 @@
 package client
 
 import (
-	"fmt"
+	"context"
+	"crypto/tls"
+	"log"
+	"net"
+	"net/http"
 
-	"kcl-lang.io/kpm/pkg/reporter"
-	"oras.land/oras-go/pkg/auth"
+	"oras.land/oras-go/v2/registry/remote"
+	"oras.land/oras-go/v2/registry/remote/auth"
+	remoteauth "oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/credentials"
 )
 
 // LoginOci will login to the oci registry.
@@ -13,30 +19,58 @@ func (c *KpmClient) LoginOci(hostname, username, password string) error {
 	if err != nil {
 		return err
 	}
-
-	opts := []auth.LoginOption{
-		auth.WithLoginHostname(hostname),
-		auth.WithLoginUsername(username),
-		auth.WithLoginSecret(password),
+	registry, err := remote.NewRegistry(hostname)
+	if err != nil {
+		return err
+	}
+	cred := remoteauth.Credential{
+		Username: username,
+		Password: password,
 	}
 
-	defaultOciPlainHttp, forceOciPlainHttp := c.GetSettings().ForceOciPlainHttp()
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: c.insecureSkipTLSverify,
+	}
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+	// log.Println("c.insecureSkipTLSverify:", c.insecureSkipTLSverify)
+	registry.Client = &auth.Client{Cache: auth.NewCache(), Client: &http.Client{Transport: transport}}
+	// if c.insecureSkipTLSverify {
+	// 	registry.PlainHTTP = true
+	// }
+	// if hostname == "localhost:5001" {
+	// 	c.isPlainHttp = true
+	// }
+	// registry.PlainHTTP = c.isPlainHttp
 
-	if defaultOciPlainHttp || forceOciPlainHttp {
-		opts = append(opts, auth.WithLoginInsecure())
+	host, _, _ := net.SplitHostPort(hostname)
+	// client.repo.PlainHTTP = false
+	if host == "localhost" {
+		// not specified, defaults to plain http for localhost
+		registry.PlainHTTP = true
 	}
 
-	err = credCli.GetAuthClient().LoginWithOpts(
-		opts...,
-	)
+	// If the plain http is specified in the settings file
+	// Override the default value of the plain http
+	if c.GetSettings() != nil {
+		isPlainHttp, force := c.GetSettings().ForceOciPlainHttp()
+		if force {
+			registry.PlainHTTP = isPlainHttp
+		}
+	}
+
+	err = credentials.Login(context.Background(), credCli.Store, registry, cred)
 
 	if err != nil {
-		return reporter.NewErrorEvent(
-			reporter.FailedLogin,
-			err,
-			fmt.Sprintf("failed to login '%s', please check registry, username and password is valid", hostname),
-		)
+		return err
 	}
+
+	c1, err := credCli.Store.Get(context.TODO(), hostname)
+	if err != nil {
+		return err
+	}
+	log.Println("credCli.username:", c1.Username)
 
 	return nil
 }

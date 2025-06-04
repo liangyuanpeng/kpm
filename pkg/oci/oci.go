@@ -19,7 +19,10 @@ import (
 	"github.com/containers/image/v5/types"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/thoas/go-funk"
+<<<<<<< HEAD
 	dockerauth "oras.land/oras-go/pkg/auth/docker"
+=======
+>>>>>>> b138e67 (cleanup oras v1)
 	remoteauth "oras.land/oras-go/v2/registry/remote/auth"
 
 	"kcl-lang.io/kpm/pkg/opt"
@@ -32,6 +35,7 @@ import (
 	"oras.land/oras-go/v2/content"
 	"oras.land/oras-go/v2/content/file"
 	"oras.land/oras-go/v2/registry/remote"
+	credentials "oras.land/oras-go/v2/registry/remote/credentials"
 	"oras.land/oras-go/v2/registry/remote/errcode"
 )
 
@@ -81,6 +85,7 @@ func WithRepoPath(repoPath string) OciClientOption {
 		if err != nil {
 			return fmt.Errorf("repository '%s' not found", repoPath)
 		}
+		// c.repo.PlainHTTP = *c.isPlainHttp
 		return nil
 	}
 }
@@ -146,6 +151,7 @@ func NewOciClientWithOpts(opts ...OciClientOption) (*OciClient, error) {
 		// Set the default value of the plain http
 		registry := client.repo.Reference.String()
 		host, _, _ := net.SplitHostPort(registry)
+		// client.repo.PlainHTTP = false
 		if host == "localhost" || registry == "localhost" {
 			// not specified, defaults to plain http for localhost
 			client.repo.PlainHTTP = true
@@ -224,6 +230,7 @@ func (ociClient *OciClient) Pull(localPath, tag string) error {
 func (ociClient *OciClient) TheLatestTag() (string, error) {
 	var tagSelected string
 
+	ociClient.repo.PlainHTTP = true
 	err := ociClient.repo.Tags(*ociClient.ctx, "", func(tags []string) error {
 		var err error
 		tagSelected, err = semver.LatestVersion(tags)
@@ -264,6 +271,7 @@ func RepoIsNotExist(err error) bool {
 func (ociClient *OciClient) ContainsTag(tag string) (bool, *reporter.KpmEvent) {
 	var exists bool
 
+	ociClient.repo.PlainHTTP = true
 	err := ociClient.repo.Tags(*ociClient.ctx, "", func(tags []string) error {
 		exists = funk.ContainsString(tags, tag)
 		return nil
@@ -354,20 +362,21 @@ func (ociClient *OciClient) FetchManifestIntoJsonStr(opts opt.OciFetchOptions) (
 }
 
 func loadCredential(hostName string, settings *settings.Settings) (*remoteauth.Credential, error) {
-	authClient, err := dockerauth.NewClientWithDockerFallback(settings.CredentialsFile)
+
+	store, err := credentials.NewStore(settings.CredentialsFile, credentials.StoreOptions{})
 	if err != nil {
 		return nil, err
 	}
-	dockerClient, _ := authClient.(*dockerauth.Client)
-	username, password, err := dockerClient.Credential(hostName)
+	c, err := store.Get(context.TODO(), hostName)
 	if err != nil {
 		return nil, err
 	}
 
 	return &remoteauth.Credential{
-		Username: username,
-		Password: password,
+		Username: c.Username,
+		Password: c.Password,
 	}, nil
+
 }
 
 // Pull will pull the oci artifacts from oci registry to local path.
